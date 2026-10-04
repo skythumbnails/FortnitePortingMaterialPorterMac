@@ -926,7 +926,18 @@ def ribbons():
 
 def _set(modifier, tree, name, value):
     identifier = next(i.identifier for i in tree.interface.items_tree if i.item_type == 'SOCKET' and i.in_out == 'INPUT' and i.name == name)
-    getattr(modifier.properties.inputs, identifier).value = value
+    if hasattr(modifier, "properties"):
+        getattr(modifier.properties.inputs, identifier).value = value
+    else:
+        # Blender before 5.2 has no NodesModifier.properties: a modifier's inputs are its ID properties
+        modifier[identifier] = value
+
+
+def _input_driver(modifier, identifier):
+    """A driver on a node modifier's input, through the API the running Blender has."""
+    if hasattr(modifier, "properties"):
+        return getattr(modifier.properties.inputs, identifier).driver_add("value")
+    return modifier.driver_add('["%s"]' % identifier)
 
 
 DEPTH_BIAS = ("Metres the particles are drawn nearer the camera, along their view rays (they look the same). "
@@ -942,8 +953,7 @@ def bias_by_order(obj, modifier, tree, scene):
     order = int(obj.get("mp_draw_order", 0))
     if identifier is None or order == 0:
         return
-    socket = getattr(modifier.properties.inputs, identifier)
-    fc = socket.driver_add("value")
+    fc = _input_driver(modifier, identifier)
     fc.keyframe_points.clear()
     for m in list(fc.modifiers):
         fc.modifiers.remove(m)
