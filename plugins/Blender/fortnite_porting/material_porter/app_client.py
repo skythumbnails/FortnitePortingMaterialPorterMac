@@ -4,6 +4,7 @@ import hashlib
 import http.client
 import json
 import os
+import sys
 import urllib.parse
 
 
@@ -18,7 +19,10 @@ READ_TIMEOUT = 120.0      # a first texture may stream from Epic's CDN; past thi
 def fetch_dir():
     """Where files fetched from the app are kept (Blender's own view of
     %LOCALAPPDATA%, so they last beyond the session)."""
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    base = os.environ.get("LOCALAPPDATA")
+    if not base and sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    base = base or os.path.expanduser("~")
     d = os.path.join(base, "MaterialPorter", "fetched")
     os.makedirs(d, exist_ok=True)
     return d
