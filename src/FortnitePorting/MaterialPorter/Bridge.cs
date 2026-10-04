@@ -102,7 +102,7 @@ public sealed class Bridge : IDisposable
     /// <summary>A file of the app's data folder as bytes; nothing outside it.</summary>
     async Task SendFile(HttpListenerContext ctx, string path)
     {
-        var root = Path.GetFullPath(GameContext.DataDir).TrimEnd('\\') + "\\";
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(GameContext.DataDir)) + Path.DirectorySeparatorChar;
         string full = null;
         try { full = string.IsNullOrEmpty(path) ? null : Path.GetFullPath(path); }
         catch { /* not a path */ }

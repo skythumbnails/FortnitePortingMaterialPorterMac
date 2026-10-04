@@ -1,5 +1,73 @@
 <div align="center">
 
+# FortnitePorting MP for Mac
+### The Material Porter fork of FortnitePorting, on macOS (Apple Silicon)
+
+[![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-black?logo=apple&logoColor=white)]()
+[![Release](https://img.shields.io/github/release/skythumbnails/FortnitePortingMaterialPorterMac)](https://github.com/skythumbnails/FortnitePortingMaterialPorterMac/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/skythumbnails/FortnitePortingMaterialPorterMac/total?color=green)]()
+
+</div>
+
+---
+
+## Installation
+
+Download `FortnitePorting-MP-<version>-arm64.dmg` from [Releases](../../releases/latest), open it and drag
+**FortnitePorting MP** into Applications.
+
+> [!IMPORTANT]
+> This is a macOS port of [kyoocreatives' Material Porter fork](https://github.com/kyoocreatives/FortnitePortingMaterialPorter),
+> itself a fork of **Halfheart**'s [FortnitePorting](https://github.com/h4lfheart/FortnitePorting). The exact materials,
+> effects and rigs are their work; this repository adds what it takes to run them on a Mac.
+
+It runs beside [FortnitePorting Mac](https://github.com/skythumbnails/FortnitePortingMac): its own settings and data
+(`~/Library/Application Support/FortnitePorting MP`) and its own Blender plugin (`fortnite_porting_mp`, port 40010).
+
+## Requirements
+
+- An Apple Silicon Mac, macOS 11 or later
+- Blender 5.x for live import (tested on 5.1.1)
+- Optional: VLC 3.x in Applications, for the cosmetic video previews
+- Optional: `brew install vgmstream`, for sound export
+
+## macOS Security Warning
+
+The app is not notarized by Apple, so macOS may warn the first time you open it. Right click the app, press
+**Open**, then **Open** again — or go to `System Settings → Privacy & Security → Open Anyway`.
+
+## What's different on Mac
+
+- **Exact materials work in On-Demand mode — no UEFN install needed.** The editor data the fork translates
+  materials from ships in Fortnite's optional `.o.utoc` containers, and On-Demand mode used to skip every one of them
+  (`HybridFileProvider` read `pakchunk0-WindowsClient.o.utoc` as an `o.utoc` file).
+- **Effects replay on Blender 5.1.** The fork's effect replay used a Blender 5.2-only API, so on 5.1 every effect
+  stayed where it was imported, at the character's feet.
+- The FortnitePorting Mac patch set: native Oodle, macOS window chrome and file drag, `afplay`/`vgmstream` audio,
+  the Forge V4 material option.
+- Video previews use VLC.app when it is installed. The fork's updater is off (its releases are Windows builds).
+
+## Known Issues
+
+- On-Demand mode with the editor data uses about 7 GB of memory.
+- With FortnitePorting Mac's plugin enabled in the same Blender, this fork's panels replace its same-named ones (as
+  on Windows), and quitting Blender prints a harmless unregister error from the other plugin.
+
+## Building from Source
+
+```bash
+git clone --recursive https://github.com/skythumbnails/FortnitePortingMaterialPorterMac
+cd FortnitePortingMaterialPorterMac
+macos/build-dmg.sh
+```
+
+Needs the .NET 10 SDK and the Xcode command line tools, on an APFS volume. The script lays `patches/CUE4Parse/` over
+the submodule, publishes for `osx-arm64`, and writes the app and the dmg to `macos/out/`.
+
+---
+
+<div align="center">
+
 # Fortnite Porting
 
 

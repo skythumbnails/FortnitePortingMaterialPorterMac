@@ -93,7 +93,30 @@ class MeshImportContext(LightImportMixin):     # MP: spot and rect lights
                 solidify.material_offset = len(master_mesh.data.materials) - 1
                 
             if rig_type == ERigType.TASTY and self.type not in [EExportType.LEGO_OUTFIT, EExportType.LEGO_WILDLIFE]:     # MP: humanoids only
-                self.create_tasty_rig(master_skeleton, self.get_metadata("MasterSkeletalMesh"))
+                # The Tasty rig builder assumes the standard humanoid skeleton; outfits with exotic
+                # skeletons (creatures, mascots, oversized props) can fail partway through. That
+                # used to abort the whole import — instead, keep the imported model on its default
+                # armature and tell the user what happened.
+                try:
+                    self.create_tasty_rig(master_skeleton, self.get_metadata("MasterSkeletalMesh"))
+                except Exception as e:
+                    import traceback
+                    Log.error(f"Tasty rig failed for {self.name}:\n{traceback.format_exc()}")
+                    try:
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    except Exception:
+                        pass
+                    # Server.instance is None when the importer runs without the add-on registered, and
+                    # with the app disconnected there is no client to tell; neither may abort the import
+                    from ...server import Server
+                    if Server.instance is not None:
+                        try:
+                            Server.instance.send_message(
+                                f"The Tasty rig could not be applied to {self.name} — it was imported with the "
+                                f"default rig instead. This usually means a non-standard skeleton. "
+                                f"({type(e).__name__}: {e})")
+                        except Exception:
+                            pass
 
             mp.settle_effects(self)     # MP
 
@@ -256,6 +279,15 @@ class MeshImportContext(LightImportMixin):     # MP: spot and rect lights
         meta["TextureData"] = mesh.get("TextureData")
 
         final = mp.final_materials(mesh, self.override_materials)     # MP: only each slot's final material is built
+
+        # Lowercase part hint for the optional Forge V4 material setup
+        # (processing/forge.py) - the material name still wins over this hint.
+        meta["ForgePart"] = {
+            EFortCustomPartType.HEAD: "head",
+            EFortCustomPartType.BODY: "body",
+            EFortCustomPartType.HAT: "faceacc",
+            EFortCustomPartType.FACE: "faceacc",
+        }.get(part_type)
 
         for material in mesh.get("Materials"):
             index = material.get("Slot")

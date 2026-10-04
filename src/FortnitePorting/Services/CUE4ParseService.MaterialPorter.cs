@@ -59,9 +59,10 @@ public partial class CUE4ParseService
             onDemand.Authorization = new AuthenticationHeaderValue("Bearer", AppSettings.Application.EpicAuth?.Token);
     }
 
-    private ManifestParseOptions OnDemandManifestOptions() => new()
+    // macOS port: Latest On-Demand passes the chunk base Epic's manifest response names (and the content build its own)
+    private ManifestParseOptions OnDemandManifestOptions(string? chunkBaseUrl = null) => new()
     {
-        ChunkBaseUrl = "https://egdownload.fastly-edge.com/Builds/Fortnite/CloudDir/",
+        ChunkBaseUrl = chunkBaseUrl ?? "https://egdownload.fastly-edge.com/Builds/Fortnite/CloudDir/",
         // FORTNITEPORTING_MP_CHUNK_CACHE shares one chunk cache between test instances (chunks are named by hash)
         ChunkCacheDirectory = Environment.GetEnvironmentVariable("FORTNITEPORTING_MP_CHUNK_CACHE") is { Length: > 0 } shared
             ? Directory.CreateDirectory(shared).FullName : CacheFolder.FullName,
