@@ -88,7 +88,10 @@ public class HybridFileProvider : AbstractVfsFileProvider
             
             UEParse.UpdateStatus($"Registering On-Demand Archive {file.FileName.SubstringAfterLast("/")}");
             
-            var extension = file.FileName.SubstringAfter('.').ToLower();
+            // The last dot, not the first: "pakchunk0-WindowsClient.o.utoc" is a utoc. Reading from the first dot made it
+            // "o.utoc", which silently dropped every optional (editor-data, .o.uasset) container in On-Demand mode.
+            // A local install keeps them (FileInfo.Extension), and on macOS On-Demand is the only way to reach them.
+            var extension = file.FileName.SubstringAfterLast('.').ToLower();
             if (extension is "pak" or "utoc")
             {
                 RegisterVfs(file.FileName, (Stream[]) [file.GetStream()],
