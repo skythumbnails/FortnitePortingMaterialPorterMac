@@ -19,6 +19,8 @@ public static class ForkUpdates
 
     public static async Task CheckAsync(InfoService info, AppService app)
     {
+        // macOS: the fork's releases are Windows-only (FortnitePortingMP.exe); a Mac build is re-ported per release
+        if (OperatingSystem.IsMacOS()) return;
         // builds that aren't releases (-dev, a commit's) don't ask
         if (Release(Globals.Version) is not (var currentBase, var currentBuild)) return;
         try

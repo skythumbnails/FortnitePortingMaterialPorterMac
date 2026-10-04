@@ -30,7 +30,10 @@ public partial class InstallationProfile : ObservableValidator
     [NotifyPropertyChangedFor(nameof(IsCustom))]
     [NotifyPropertyChangedFor(nameof(IsCustomOnDemand))]
     [NotifyPropertyChangedFor(nameof(CanDownloadBuild))]
-    private EFortniteVersion _fortniteVersion = EFortniteVersion.LatestInstalled;
+    // macOS default: On-Demand (no local Fortnite install required to get started). Users can
+    // switch a profile to "Latest (Installed)" and point at a local Paks folder to use their
+    // own game data instead.
+    private EFortniteVersion _fortniteVersion = EFortniteVersion.LatestOnDemand;
     
     [NotifyDataErrorInfo]
     [ArchiveDirectory(canValidateProperty: nameof(ArchiveDirectoryEnabled))]
@@ -94,7 +97,11 @@ public partial class InstallationProfile : ObservableValidator
     [JsonIgnore] public bool MappingsFileEnabled => IsCustom;
     // Material Porter fork: an older install (Custom) streams too when it has an on-demand TOC of its own -
     // the chunks its build lists (the latest build's TOC, the Latest modes', wouldn't match it)
-    [JsonIgnore] public bool TextureStreamingEnabled => FortniteVersion is EFortniteVersion.LatestInstalled || IsCustomOnDemand || IsCustom && HasOnDemandToc;
+    // macOS: Fortnite 41.20+ moved cosmetic icon textures into the IAS on-demand container
+    // (pakchunk100iad), which is only reachable through .uondemandtoc registration. That
+    // registration is gated on TextureStreamingEnabled, so On-Demand installs need it too —
+    // without it every cosmetic icon falls back to the pink placeholder.
+    [JsonIgnore] public bool TextureStreamingEnabled => FortniteVersion is EFortniteVersion.LatestInstalled or EFortniteVersion.LatestOnDemand || IsCustomOnDemand || IsCustom && HasOnDemandToc;
     [JsonIgnore] public bool HasOnDemandToc => Directory.Exists(ArchiveDirectory) && Directory.EnumerateFiles(ArchiveDirectory, "*.uondemandtoc").Any();
     [JsonIgnore] public bool LoadInstalledBundlesEnabled => FortniteVersion is EFortniteVersion.LatestInstalled;
     [JsonIgnore] public bool CanFetchVersion => !string.IsNullOrWhiteSpace(FetchVersion);

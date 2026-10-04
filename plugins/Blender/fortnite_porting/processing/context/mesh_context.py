@@ -167,7 +167,30 @@ class MeshImportContext:
                 
             # Material Porter fork: Tasty's rig is for Fortnite's humanoid skeleton, not a LEGO figure's or creature's
             if rig_type == ERigType.TASTY and self.type not in [EExportType.LEGO_OUTFIT, EExportType.LEGO_WILDLIFE]:
-                self.create_tasty_rig(master_skeleton, self.get_metadata("MasterSkeletalMesh"))
+                # The Tasty rig builder assumes the standard humanoid skeleton; outfits with exotic
+                # skeletons (creatures, mascots, oversized props) can fail partway through. That
+                # used to abort the whole import — instead, keep the imported model on its default
+                # armature and tell the user what happened.
+                try:
+                    self.create_tasty_rig(master_skeleton, self.get_metadata("MasterSkeletalMesh"))
+                except Exception as e:
+                    import traceback
+                    Log.error(f"Tasty rig failed for {self.name}:\n{traceback.format_exc()}")
+                    try:
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    except Exception:
+                        pass
+                    # Server.instance is None when the importer runs without the add-on registered, and
+                    # with the app disconnected there is no client to tell; neither may abort the import
+                    from ...server import Server
+                    if Server.instance is not None:
+                        try:
+                            Server.instance.send_message(
+                                f"The Tasty rig could not be applied to {self.name} — it was imported with the "
+                                f"default rig instead. This usually means a non-standard skeleton. "
+                                f"({type(e).__name__}: {e})")
+                        except Exception:
+                            pass
 
             if self.mp_deferred_effects is not None:
                 from ...material_porter import effects as mp_effects
@@ -405,6 +428,15 @@ class MeshImportContext:
                 shown = td_override if td_override and material.get("Slot") == 0 else material
                 if shown.get("Name") == variant_override_material.get("MaterialNameToSwap"):
                     final[index] = variant_override_material.get("Material")
+
+        # Lowercase part hint for the optional Forge V4 material setup
+        # (processing/forge.py) - the material name still wins over this hint.
+        meta["ForgePart"] = {
+            EFortCustomPartType.HEAD: "head",
+            EFortCustomPartType.BODY: "body",
+            EFortCustomPartType.HAT: "faceacc",
+            EFortCustomPartType.FACE: "faceacc",
+        }.get(part_type)
 
         for material in mesh.get("Materials"):
             index = material.get("Slot")
