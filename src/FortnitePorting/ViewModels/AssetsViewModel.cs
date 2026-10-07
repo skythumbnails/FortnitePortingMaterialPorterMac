@@ -149,7 +149,7 @@ public partial class AssetsViewModel(
                 await _supaBase.PostExports([
                     .._assetLoader.ActiveLoader.SelectedAssetInfos
                         .OfType<AssetInfo>()
-                        .Select(asset => asset.Asset.CreationData.Object.GetPathName()),
+                        .Select(asset => asset.Asset.CreationData.ObjectPath),
                     .._assetLoader.ActiveLoader.SelectedAssetInfos
                         .OfType<CustomAssetInfo>()
                         .Select(asset => $"Custom/{asset.Asset.Asset.Name}"),
@@ -334,7 +334,7 @@ public partial class AssetsViewModel(
     {
         return _assetLoader.ActiveLoader?.SelectedAssetInfos
             .OfType<AssetInfo>()
-            .Select(asset => asset.Asset.CreationData.Object.GetPathName())
+            .Select(asset => asset.Asset.CreationData.ObjectPath)
             .ToArray() ?? [];
     }
 

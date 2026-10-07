@@ -85,6 +85,7 @@ public class AssetItem : Base.BaseAssetItem
         // Everything the grid needs (rarity, set, season, series, icon path) is now captured, so
         // drop the parsed asset object. It re-parses on demand for export/preview/styles. This is
         // the main lever that keeps a loaded tab from pinning thousands of parsed UObjects in RAM.
+        CreationData.CaptureFilterMetadata();
         CreationData.ReleaseObject();
     }
 
