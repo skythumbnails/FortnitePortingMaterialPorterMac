@@ -47,6 +47,20 @@ The app is not notarized by Apple, so macOS may warn the first time you open it.
   the Forge V4 material option.
 - Video previews use VLC.app when it is installed. The fork's updater is off (its releases are Windows builds).
 
+## mp.13 Mac update
+
+Includes upstream mp.13's shell fur, skin/fur subsurface settings, cleaner material graphs,
+texture-size limit and compressed GPU textures, map options and older-build fixes.
+
+Asset tabs resolve icon paths without loading every icon texture first, and package lookups reuse
+a sorted archive index. In the October 7 on-demand benchmark on this Mac, Outfits fell from
+about 14–16 seconds to 4–5 seconds. This measures listing, not downloading every thumbnail.
+Lossless PNG export uses faster compression: identical decoded pixels, somewhat larger files.
+ReadyToRun reduces first-use compilation. Network/cache state and hardware affect results.
+
+The Mac theme, Forge V4 integration, separate Blender plugin, audio fixes and optional editor
+material data remain included. The launcher now bounds runtime probes and validates its fallback.
+
 ## Known Issues
 
 - On-Demand mode with the editor data uses about 7 GB of memory.
