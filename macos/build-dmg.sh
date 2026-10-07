@@ -15,8 +15,8 @@ DOTNET="${DOTNET:-dotnet}"
 VERSION="$(sed -n 's#.*<Version>\(.*\)</Version>.*#\1#p' "$ROOT/src/FortnitePorting/FortnitePorting.csproj" | head -1)"
 BUILD="${VERSION##*.}"
 
-# The CUE4Parse fixes this fork carries, laid over the submodule (the fork's FSpline.cs, the Mac patch's
-# IoChunkToc.cs and CMakeLists.txt)
+# The CUE4Parse fixes this fork carries, laid over the submodule (the fork's FSpline.cs and static mesh reading, the
+# Mac patch's IoChunkToc.cs and CMakeLists.txt, the lock-free file lookups and the fast PNG export)
 # (by content, so a rebuild leaves the submodule untouched)
 rsync -rc "$ROOT/patches/CUE4Parse/" "$ROOT/external/CUE4Parse/"
 
@@ -24,8 +24,9 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 # _EnableMacOSCodeSign=false: the hosts are signed (or not) below, on purpose
+# PublishReadyToRun: the assemblies precompiled - less JIT at startup and on a tab's or an export's first run
 "$DOTNET" publish "$ROOT/src/FortnitePorting/FortnitePorting.csproj" -c Release -r osx-arm64 --self-contained true \
-    -p:PublishSingleFile=false -p:MPPrivateRoot=none/ -p:_EnableMacOSCodeSign=false -o "$WORK/publish"
+    -p:PublishSingleFile=false -p:PublishReadyToRun=true -p:MPPrivateRoot=none/ -p:_EnableMacOSCodeSign=false -o "$WORK/publish"
 
 APP="$WORK/stage/FortnitePorting MP.app"
 CONTENTS="$APP/Contents"
