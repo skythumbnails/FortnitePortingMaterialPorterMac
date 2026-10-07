@@ -62,7 +62,7 @@ internal static class Program
         }
         catch (Exception e)
         {
-            Debugger.Break();
+            Console.Error.WriteLine(e);
             Log.Fatal(e.ToString());
         }
         finally
