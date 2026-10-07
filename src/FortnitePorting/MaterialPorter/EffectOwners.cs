@@ -150,20 +150,27 @@ public static class EffectOwners
     }
 
     /// <summary>A system's item: one, or a few that share it (names joined, first icon); none when many share it.</summary>
-    private static Owner? Of(UObject system)
+    private static Owner? Of(UObject system) => Of(system.GetPathName());
+
+    private static Owner? Of(string systemPath)
     {
-        if (!_byPackage.TryGetValue(Package(system.GetPathName()), out var owners) || owners.IsEmpty || owners.Count > SharedMost) return null;
+        if (!_byPackage.TryGetValue(Package(systemPath), out var owners) || owners.IsEmpty || owners.Count > SharedMost) return null;
         var sorted = owners.Keys.OrderBy(o => o.Name, StringComparer.OrdinalIgnoreCase).ToList();
         return sorted.Count == 1 ? sorted[0]
             : new Owner(string.Join(" / ", sorted.Select(o => o.Name).Distinct()), sorted.FirstOrDefault(o => o.Icon is not null)?.Icon, sorted[0].Kind);
     }
 
-    public static bool Owned(UObject system) => Of(system) is not null;
+    public static bool Owned(UObject system) => Owned(system.GetPathName());
 
-    public static string KindOf(UObject system)
+    // (by path too: the tab's filters run on items whose objects were released)
+    public static bool Owned(string systemPath) => Of(systemPath) is not null;
+
+    public static string KindOf(UObject system) => KindOf(system.GetPathName());
+
+    public static string KindOf(string systemPath)
     {
-        if (Of(system) is { } owner) return owner.Kind;
-        var path = Package(system.GetPathName());
+        if (Of(systemPath) is { } owner) return owner.Kind;
+        var path = Package(systemPath);
         return PathKinds.FirstOrDefault(k => k.Match.IsMatch(path)).Kind ?? "Other";
     }
 

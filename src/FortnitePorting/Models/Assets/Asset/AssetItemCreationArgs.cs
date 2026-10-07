@@ -1,4 +1,5 @@
 using CUE4Parse.UE4.Assets.Exports;
+using FortnitePorting.Exporting.MaterialPorter;
 using CUE4Parse.UE4.Objects.GameplayTags;
 using FortnitePorting.Models.Assets.Base;
 
@@ -43,6 +44,22 @@ public class AssetItemCreationArgs : BaseAssetItemCreationArgs
     public string? ObjectPath { get; set; }
     public string ObjectName { get; set; } = string.Empty;
     public string ObjectClassName { get; set; } = string.Empty;
+
+    public bool EffectPlays { get; private set; }
+    public bool AnimationOwned { get; private set; }
+    public string? AnimationKind { get; private set; }
+
+    // Capture filter facts while the original object (including unloaded outline metadata) exists.
+    public void CaptureFilterMetadata()
+    {
+        if (_object is not { } asset) return;
+        if (ObjectClassName == "NiagaraSystem") EffectPlays = Effects.Plays(asset);
+        if (Unloaded.Detail(asset) is Animations.Outline outline)
+        {
+            AnimationOwned = outline.Owner is not null;
+            AnimationKind = outline.Kind;
+        }
+    }
 
     // Drops the parsed object tree; the getter reloads it the next time it's genuinely needed.
     public void ReleaseObject() => _object = null;

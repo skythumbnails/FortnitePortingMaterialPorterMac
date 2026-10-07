@@ -42,9 +42,10 @@ public partial class AssetLoaderService
             {
                 new FilterCategory("EFFECT", [EExportType.Effect])
                 {
-                    Filters = [new FilterItem("Plays in Blender", asset => Effects.Plays(asset.CreationData.Object)),
-                        new FilterItem("Of an Item", asset => EffectOwners.Owned(asset.CreationData.Object)),
-                        ..EffectOwners.Kinds.Select(kind => new FilterItem(kind, asset => EffectOwners.Is(asset.CreationData.Object, kind)))]
+                    // (on captured metadata: the grid releases each item's object, a filter must not re-read it)
+                    Filters = [new FilterItem("Plays in Blender", asset => asset.CreationData.EffectPlays),
+                        new FilterItem("Of an Item", asset => asset.CreationData.ObjectPath is { } path && EffectOwners.Owned(path)),
+                        ..EffectOwners.Kinds.Select(kind => new FilterItem(kind, asset => asset.CreationData.ObjectPath is { } path && EffectOwners.KindOf(path) == kind))]
                 }
             },
         });
@@ -77,9 +78,9 @@ public partial class AssetLoaderService
             {
                 new FilterCategory("ANIMATION", [EExportType.Animation])
                 {
-                    Filters = [new FilterItem("Of an Item", asset => Animations.Owned(asset.CreationData.Object)),
+                    Filters = [new FilterItem("Of an Item", asset => asset.CreationData.AnimationOwned),
                         ..Animations.Kinds.Select(k => k.Kind).Append("Other")
-                        .Select(kind => new FilterItem(kind, asset => Animations.Is(asset.CreationData.Object, kind)))]
+                        .Select(kind => new FilterItem(kind, asset => asset.CreationData.AnimationKind == kind))]
                 }
             },
         });
@@ -151,12 +152,12 @@ public partial class AssetLoaderService
                         {
                             Filters =
                             [
-                                new FilterItem("Props & Sets", asset => Figures.PropClasses.Contains(asset.CreationData.Object.ExportType)),
-                                new FilterItem("Building Pieces", asset => asset.CreationData.Object.ExportType == Figures.BuildClass
-                                                                           && asset.CreationData.Object.Name.StartsWith("JBID_")),
-                                new FilterItem("Stations & Placeables", asset => asset.CreationData.Object.ExportType == Figures.BuildClass
-                                                                                 && !asset.CreationData.Object.Name.StartsWith("JBID_")),
-                                new FilterItem("Caves", asset => asset.CreationData.Object.ExportType == Figures.CaveClass),
+                                new FilterItem("Props & Sets", asset => Figures.PropClasses.Contains(asset.CreationData.ObjectClassName)),
+                                new FilterItem("Building Pieces", asset => asset.CreationData.ObjectClassName == Figures.BuildClass
+                                                                           && asset.CreationData.ObjectName.StartsWith("JBID_")),
+                                new FilterItem("Stations & Placeables", asset => asset.CreationData.ObjectClassName == Figures.BuildClass
+                                                                                 && !asset.CreationData.ObjectName.StartsWith("JBID_")),
+                                new FilterItem("Caves", asset => asset.CreationData.ObjectClassName == Figures.CaveClass),
                             ]
                         }
                     }
