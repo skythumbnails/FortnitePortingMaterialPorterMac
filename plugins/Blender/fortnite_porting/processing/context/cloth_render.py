@@ -181,7 +181,13 @@ def _inputs(obj, **values):
     mod = obj.modifiers[MODIFIER]
     ids = {i.name: i.identifier for i in mod.node_group.interface.items_tree if i.in_out == 'INPUT'}
     for k, v in values.items():
-        getattr(mod.properties.inputs, ids[k]).value = v
+        if hasattr(mod, "properties"):
+            getattr(mod.properties.inputs, ids[k]).value = v
+        else:
+            # Blender before 5.2 has no NodesModifier.properties: a modifier's inputs are its ID properties
+            mod[ids[k]] = v
+    if not hasattr(mod, "properties"):
+        obj.update_tag()     # (a Python write to an ID property tags nothing)
 
 
 def _store(data, start, pos, valid):
