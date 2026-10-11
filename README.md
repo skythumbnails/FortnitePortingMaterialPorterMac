@@ -47,6 +47,20 @@ The app is not notarized by Apple, so macOS may warn the first time you open it.
   the Forge V4 material option.
 - Video previews use VLC.app when it is installed. The fork's updater is off (its releases are Windows builds).
 
+## mp.85 Mac update
+
+Includes upstream mp.85: character dynamics (hair, necklaces and earrings from physics assets, Chaos cloth on
+coats, skirts and capes, wind), Fortnite's official body rig, Control Rig and deform correctives, the MetaHuman and
+flipbook face boards, the rig kit for vehicles, creatures and LEGO figures, effect filters by the item they belong
+to, subsurface base and profile colour, landscape detail and a map actor name filter.
+
+Mac changes carried forward from mp.13: icons listed by path, lock-free archive lookups, fast lossless PNG export,
+ReadyToRun, throttled loading status and the bounded launcher probe. The Blender 5.1 fallback for effect replay now
+covers the new cloth replay too, and the new effect filters read each item's saved path instead of reloading it.
+
+The Mac theme, Forge V4 integration, separate Blender plugin, audio fixes and optional editor material data remain
+included.
+
 ## Known Issues
 
 - On-Demand mode with the editor data uses about 7 GB of memory.
