@@ -16,7 +16,7 @@ VERSION="$(sed -n 's#.*<Version>\(.*\)</Version>.*#\1#p' "$ROOT/src/FortnitePort
 BUILD="${VERSION##*.}"
 
 # The CUE4Parse fixes this fork carries, laid over the submodule (the fork's FSpline.cs and static mesh reading, the
-# Mac patch's IoChunkToc.cs and CMakeLists.txt, the lock-free file lookups and the fast PNG export)
+# Mac patch's IoChunkToc.cs and CMakeLists.txt, the lock-free file lookups, the fast PNG export and the usmap v5 reader)
 # (by content, so a rebuild leaves the submodule untouched)
 rsync -rc "$ROOT/patches/CUE4Parse/" "$ROOT/external/CUE4Parse/"
 
