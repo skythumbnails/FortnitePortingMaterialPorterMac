@@ -19,6 +19,8 @@ class BaseImportContext:
         self.type = EExportType(data.get("Type"))
         self.scale = 0.01 if self.options.get("ScaleDown") else 1
         self.meshes = []
+        self.mesh_indices = {}
+        self.metadata_cache = {}
         self.override_materials = []
         self.override_parameters = []
         self.override_morph_targets = []
@@ -49,18 +51,17 @@ class BaseImportContext:
         elif import_type == EPrimitiveExportType.MATERIAL:
             self.import_material_standalone(data)
         elif import_type == EPrimitiveExportType.TASTY_RIG:
-            self.import_tasty_rig_standalone(data)
+            from ...material_porter import mesh_hooks     # MP: the official rig when it's the chosen one, or a face board
+            if not mesh_hooks.apply_rig(self, data):     # MP
+                self.import_tasty_rig_standalone(data)
 
     def load_blend_data(self):
         ensure_blend_data()
 
     def gather_metadata(self, *search_props):
-        # MP: metadata doesn't change during an import: each search is read once (a scan per object was
-        # quadratic on big worlds); callers get a copy
-        memo = self.__dict__.setdefault("_metadata_memo", {})
-        key = (id(self.meshes), search_props)
-        if key in memo:
-            return dict(memo[key])
+        if search_props in self.metadata_cache:
+            return dict(self.metadata_cache[search_props])
+
         out_props = {}
         for mesh in self.meshes:
             meta = mesh.get("Meta")
@@ -77,8 +78,8 @@ class BaseImportContext:
                                      "which will be ignored")
                         continue
                     out_props[found_key] = meta.get(found_key)
-        memo[key] = dict(out_props)
-        return out_props
+        self.metadata_cache[search_props] = out_props
+        return dict(out_props)
 
     def get_metadata(self, search_prop):
         for mesh in self.meshes:

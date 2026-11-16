@@ -3,12 +3,14 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using CUE4Parse.UE4.Assets.Exports;
+using CUE4Parse.UE4.Assets.Exports.EdGraph;
 using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Objects.Core.i18N;
 using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Objects.Engine.VectorField;
 using CUE4Parse.UE4.Objects.UObject;
+using CUE4Parse.Utils;
 using FortnitePorting.CUE4Parse.Extensions;
 using CUE4Parse.UE4.Objects.Engine;
 using Newtonsoft.Json;
@@ -113,7 +115,22 @@ public static class Effects
         }
     }
 
-    public static async System.Threading.Tasks.Task<Outline?> ReadOutline(global::CUE4Parse.FileProvider.IFileProvider provider, string package, string name)
+    // outlines from an earlier listing of the same build: reading every system's export map takes minutes
+    private static readonly OutlineCache<Outline> _cache = new("effect",
+        f => f.Length == 5 && int.TryParse(f[2], out var emitters) && int.TryParse(f[3], out var gpu)
+            ? new Outline(f[1].Length > 0 ? f[1] : null, emitters, gpu, f[4].Split('|', StringSplitOptions.RemoveEmptyEntries)) : null,
+        o => $"{o.Class}	{o.Emitters}	{o.Gpu}	{string.Join('|', o.Draws)}");
+
+    /// <summary>Outlines saved from a listing of the same build (<see cref="OutlineCache{T}.KeyOf"/>).</summary>
+    public static void Recall(string file, string key) => _cache.Recall(file, key);
+
+    /// <summary>Keeps this listing's outlines for the next one.</summary>
+    public static void Remember() => _cache.Remember();
+
+    public static System.Threading.Tasks.Task<Outline?> ReadOutline(global::CUE4Parse.FileProvider.IFileProvider provider, string package, string name) =>
+        _cache.Get(package, () => ReadMaps(provider, package, name));
+
+    private static async System.Threading.Tasks.Task<Outline?> ReadMaps(global::CUE4Parse.FileProvider.IFileProvider provider, string package, string name)
     {
         try
         {
@@ -379,10 +396,9 @@ public static class Effects
         var curve = system.Owner!.GetExports().FirstOrDefault(e => e.Name == inner[^1] && (inner.Length < 2 || e.Outer?.Name.Text == inner[^2]));
         if (curve is null || !curve.GetOrDefault("bExposeCurve", false)
             || curve.GetOrDefault<global::CUE4Parse.UE4.Assets.Exports.Texture.UTexture?>("ExposedTexture") is not { } texture
-            || global::CUE4Parse_Conversion.Textures.TextureDecoder.Decode(texture, global::CUE4Parse.UE4.Assets.Exports.Texture.ETexturePlatform.DesktopMobile) is not { } decoded)
+            || global::CUE4Parse_Conversion.Textures.TextureDecoder.Decode(texture, global::FortnitePorting.Shared.Options.SharedExportOptions.Default) is not { } decoded)
             return null;
-        var data = global::CUE4Parse_Conversion.Textures.TextureEncoder.Encode(decoded,
-            global::CUE4Parse_Conversion.Options.ETextureFormat.Png, true, out var ext);
+        var data = global::CUE4Parse_Conversion.Textures.TextureEncoder.Encode(decoded, global::FortnitePorting.Shared.Options.SharedExportOptions.Default, out var ext);
         // linear: the curve's own values (HDR where they exceed 1)
         var name = "Curve_" + Convert.ToHexString(System.Security.Cryptography.SHA1.HashData(data))[..12] + "_Lin";
         var file = System.IO.Path.Combine(dir, name + "." + ext.Trim('.').ToLowerInvariant());
@@ -416,6 +432,22 @@ public static class Effects
         return name is { Length: > 0 } && name != "None" ? name : null;
     }
 
+    // An uncooked system's graph nodes (its module stacks), by path in the package (each emitter's graph has the same names):
+    // each pin's name, direction, value and what it links to ({node, pin}), which is where a module input's dynamic input or curve is
+    private static string NodePath(UObject node) => node.GetPathName().SubstringAfter(':');
+
+    private static Dictionary<FGuid, (string Node, string Pin)> PinNames(IEnumerable<UObject> exports) =>
+        exports.OfType<UEdGraphNode>().SelectMany(n => n.Pins.OfType<UEdGraphPin>().Select(p => (n, p)))
+            .GroupBy(x => x.p.PinId).ToDictionary(g => g.Key, g => (NodePath(g.First().n), g.First().p.PinName.Text));
+
+    private static JArray Pins(UEdGraphNode node, Dictionary<FGuid, (string Node, string Pin)> names) =>
+        new(node.Pins.OfType<UEdGraphPin>().Select(p => new JObject
+        {
+            ["name"] = p.PinName.Text, ["dir"] = p.Direction.ToString(), ["value"] = p.DefaultValue, ["category"] = p.PinType?.PinCategory.Text,
+            ["links"] = new JArray(p.LinkedTo.Where(l => l != null && names.ContainsKey(l.PinId))
+                .Select(l => new JObject { ["node"] = names[l!.PinId].Node, ["pin"] = names[l.PinId].Pin })),
+        }));
+
     // compiled data only the engine's own VM and the editor read
     private static readonly HashSet<string> Unread =
         ["ExperimentalContextData", "StatScopes", "CompileTags", "ShaderScriptParametersMetadata", "SimulationStageMetaData"];
@@ -428,6 +460,7 @@ public static class Effects
     {
         var serializer = JsonSerializer.Create(new JsonSerializerSettings { ReferenceLoopHandling = ReferenceLoopHandling.Ignore });
         var exports = new JArray();
+        var pinNames = PinNames(system.Owner!.GetExports());
         foreach (var export in system.Owner!.GetExports())
         {
             var props = new JObject();
@@ -436,7 +469,13 @@ public static class Effects
                     props[p.Name.Text] = JToken.FromObject(value, serializer);
             Prune(props);
             if (export.ExportType == "NiagaraMeshRendererProperties" && MeshBounds(export) is { } bounds) props["MPBounds"] = bounds;
-            exports.Add(new JObject { ["name"] = export.Name, ["type"] = export.ExportType, ["outer"] = export.Outer?.Name.Text, ["props"] = props });
+            var entry = new JObject { ["name"] = export.Name, ["type"] = export.ExportType, ["outer"] = export.Outer?.Name.Text, ["props"] = props };
+            if (export is UEdGraphNode node)
+            {
+                entry["path"] = NodePath(node);
+                entry["pins"] = Pins(node, pinNames);
+            }
+            exports.Add(entry);
         }
         // the parameter collections its scripts read (time of day, wind): each one's values from its default instance's store
         // (a script's cooked store only holds placeholders)

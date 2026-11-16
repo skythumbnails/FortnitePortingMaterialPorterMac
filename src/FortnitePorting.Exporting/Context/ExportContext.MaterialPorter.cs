@@ -10,6 +10,7 @@ using CUE4Parse.UE4.Assets.Exports.Component.Landscape;
 using CUE4Parse.UE4.Assets.Exports.Material;
 using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
 using CUE4Parse.UE4.Assets.Exports.StaticMesh;
+using CUE4Parse.UE4.Assets.Exports.Texture;
 using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Objects.Engine;
 using CUE4Parse.UE4.Assets.Objects;
@@ -36,11 +37,54 @@ public partial class ExportContext
     /// <summary>Tests: only actors whose name holds this (null: all).</summary>
     public static string? MaterialPorterActorFilter;
 
-    /// <summary>Only actors whose name holds this (the Map page's filter, else the tests'; null: all).</summary>
+    /// <summary>The Map page's filter, else the tests' (null: all).</summary>
     string? ActorFilter => Meta.ActorFilter ?? MaterialPorterActorFilter;
+
+    string[]? _filterTerms;
+    string[] FilterTerms => _filterTerms ??= (ActorFilter ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    /// <summary>Whether any of the filter's comma-separated terms is in the actor's name or the mesh's (no terms: all).</summary>
+    bool PassesFilter(string actor, string? meshPath = null) => FilterTerms.Length == 0 || FilterTerms.Any(term =>
+        actor.Contains(term, StringComparison.OrdinalIgnoreCase)
+        || meshPath is not null && Path.GetFileName(meshPath).Contains(term, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>The largest textures are exported at for this export's type (0: full size).</summary>
     public int TextureCap;
+
+    private readonly HashSet<string> _mpTexturesQueued = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Whether a texture's file needs writing: missing, or smaller than the mip this export's cap picks
+    /// (FP compared against the full mip, so every capped texture was encoded again). Once per path per export.</summary>
+    private bool MaterialPorterTextureNeedsExport(UTexture texture, string path)
+    {
+        lock (_mpTexturesQueued)
+            if (_mpTexturesQueued.Contains(path)) return false;
+        bool needed;
+        try
+        {
+            if (!File.Exists(path)) needed = true;
+            else
+            {
+                var mip = TextureCap > 0 && texture is not UTextureCube ? texture.GetMipByMaxSize(TextureCap) : texture.GetFirstMip();
+                if (mip is null) needed = true;
+                else
+                {
+                    using var file = File.OpenRead(path);
+                    using var image = System.Drawing.Image.FromStream(file, useEmbeddedColorManagement: false, validateImageData: false);
+                    needed = mip.SizeX > image.PhysicalDimension.Width && mip.SizeY > image.PhysicalDimension.Height;
+                }
+            }
+        }
+        catch (Exception)
+        {
+            needed = true;
+        }
+        if (!needed) return false;
+        lock (_mpTexturesQueued) return _mpTexturesQueued.Add(path);
+    }
+
+    /// <summary>This export's steps, as the status log shows them.</summary>
+    ExportTrace MPTrace => ExportTrace.Of(Meta);
 
     private readonly Dictionary<string, ExportMesh?> _mpMeshes = new(StringComparer.OrdinalIgnoreCase);
 
@@ -70,18 +114,28 @@ public partial class ExportContext
             {
                 Instances = actors && Meta.WorldFlags.HasFlag(EWorldFlags.InstancedFoliage),
                 Landscape = false,
+                Hidden = Meta.WorldFlags.HasFlag(EWorldFlags.Hidden),
             };
             var scan = new MapScan { Name = package, Key = package };
             var reader = new MapReader(new MapGame { Provider = FileProvider }, options, scan);
             // UEFN island cells aren't in the runtime hash (FP never visits them); read them too
-            var levels = new List<string> { package };
-            levels.AddRange(IslandCells(level, package));
+            var levels = Meta.MPLevels ?? [package, ..IslandCells(level, package)];
             try
             {
                 foreach (var read in levels)
                 {
                     CancellationToken.ThrowIfCancellationRequested();
-                    reader.LevelAsync(read, Matrix4x4.Identity, 0, CancellationToken).GetAwaiter().GetResult();
+                    reader.Layer = Meta.MPLayerOf?.GetValueOrDefault(read);
+                    try
+                    {
+                        reader.LevelAsync(read, Matrix4x4.Identity, 0, CancellationToken).GetAwaiter().GetResult();
+                    }
+                    catch (Exception e) when (e is not OperationCanceledException && Meta.MPLevels != null)
+                    {
+                        // a loose actor package deleted or being saved since it was listed
+                        scan.Skip("unreadable actor packages");
+                        MaterialPorter.Failures.Note("level reads", read, e);
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -107,22 +161,24 @@ public partial class ExportContext
                     tracks.Select(t => t.Actor).Distinct().Count());
 
             var placed = (actors ? reader.Placed.Concat(tracks) : [])
-                .Where(m => ActorFilter is null || m.Actor.Contains(ActorFilter, StringComparison.OrdinalIgnoreCase))
+                .Where(m => PassesFilter(m.Actor, m.Mesh))
                 .OrderBy(m => m.Actor, StringComparer.Ordinal).ThenBy(m => m.Mesh, StringComparer.Ordinal).ToList();
             var done = 0;
+            var groups = placed.Where(m => m.Group != null).GroupBy(m => m.Group).ToDictionary(g => g.Key, g => g.ToList());
             foreach (var m in placed)
             {
                 if (CancellationToken.IsCancellationRequested) break;
                 if (++done % 200 == 0) Meta.OnUpdateProgress(m.Actor, done, placed.Count);
-                meshes.AddIfNotNull(Placement(m));
+                if (m.Group is null) meshes.AddIfNotNull(Placement(m));
+                else if (groups.Remove(m.Group, out var members)) meshes.AddRange(InstanceGroup(members));
             }
-            var lights = reader.Lights.Where(l => ActorFilter is null || l.Actor.Contains(ActorFilter, StringComparison.OrdinalIgnoreCase))
+            var lights = reader.Lights.Where(l => PassesFilter(l.Actor))
                 .OrderBy(l => l.Actor, StringComparer.Ordinal).ThenBy(l => l.Name, StringComparer.Ordinal)
                 .ThenBy(l => l.World.M41).ThenBy(l => l.World.M42).ThenBy(l => l.World.M43);
             if (withLights)
                 foreach (var l in lights) MaterialPorterLights.Add(Light(l));
 
-            var decals = reader.Decals.Where(d => ActorFilter is null || d.Actor.Contains(ActorFilter, StringComparison.OrdinalIgnoreCase))
+            var decals = reader.Decals.Where(d => PassesFilter(d.Actor))
                 .OrderBy(d => d.Actor, StringComparer.Ordinal).ThenBy(d => d.Name, StringComparer.Ordinal)
                 .ThenBy(d => d.World.M41).ThenBy(d => d.World.M42).ThenBy(d => d.World.M43);
             if (withDecals)
@@ -131,28 +187,24 @@ public partial class ExportContext
                     if (CancellationToken.IsCancellationRequested) break;
                     MaterialPorterDecals.AddIfNotNull(Decal(d));
                 }
-            var effects = reader.Effects.Where(e => ActorFilter is null || e.Actor.Contains(ActorFilter, StringComparison.OrdinalIgnoreCase))
+            var effects = reader.Effects.Where(e => PassesFilter(e.Actor))
                 .OrderBy(e => e.Actor, StringComparer.Ordinal).ThenBy(e => e.Name, StringComparer.Ordinal)
                 .ThenBy(e => e.World.M41).ThenBy(e => e.World.M42).ThenBy(e => e.World.M43);
             if (withEffects)
                 foreach (var e in effects) MaterialPorterEffects.Add(Effect(e));
-            Log.Information("[Material Porter] {Level}: {Count} placements ({Unshadowed} casting no shadow), {Lights} lights, {Decals} decals, {Effects} effects, skipped {Skipped}",
-                package, meshes.Count, meshes.Count(m => m is MaterialPorterMesh { MPCastShadow: false }),
-                withLights ? reader.Lights.Count : 0, withDecals ? reader.Decals.Count : 0, withEffects ? reader.Effects.Count : 0,
-                string.Join(", ", scan.Skipped.Select(kv => $"{kv.Value} {kv.Key}")));
+            MPTrace.Level($"{package}: {meshes.Count} placements ({meshes.Count(m => m is MaterialPorterMesh { MPCastShadow: false })} casting no shadow), " +
+                          $"{(withLights ? reader.Lights.Count : 0)} lights, {(withDecals ? reader.Decals.Count : 0)} decals, " +
+                          $"{(withEffects ? reader.Effects.Count : 0)} effects, skipped {string.Join(", ", scan.Skipped.Select(kv => $"{kv.Value} {kv.Key}"))}");
         }
 
         // terrain and HLODs go through FP's own export
-        foreach (var actorLazy in level.Actors)
+        foreach (var actor in TerrainActors(level))
         {
             if (CancellationToken.IsCancellationRequested) break;
-            if (actorLazy is null || actorLazy.IsNull) continue;
-            var type = actorLazy.ResolvedObject?.Class?.Name.Text ?? string.Empty;
-            if (!type.Contains("Landscape", StringComparison.Ordinal) && type != "FortMainHLOD") continue;
-            if (actorLazy.Load() is not { } actor) continue;
-            if (ActorFilter is { } only && !actor.Name.Contains(only, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!PassesFilter(actor.Name)) continue;
             if (actor is ALandscapeProxy proxy)
             {
+                if (!InTerrainAreas(proxy)) continue;
                 // FP names a weight layer after its LayerInfo asset; exact materials ask by LayerName
                 var names = LandscapeLayerNames(proxy);
                 foreach (var landscape in Actor(actor, loadTemplate: false).Where(x => x is not null))
@@ -162,6 +214,7 @@ public partial class ExportContext
                         Name = landscape.Name, Path = landscape.Path, NumLods = landscape.NumLods, IsEmpty = landscape.IsEmpty,
                         Location = landscape.Location, Rotation = landscape.Rotation, Scale = landscape.Scale,
                         MPLayerNames = names,
+                        MPGrass = LandscapeGrass(landscape),
                     };
                     export.Materials.AddRange(landscape.Materials);
                     export.OverrideMaterials.AddRange(landscape.OverrideMaterials);
@@ -173,6 +226,50 @@ public partial class ExportContext
         }
 
         return meshes;
+    }
+
+    static bool IsTerrain(string type) => type.Contains("Landscape", StringComparison.Ordinal) || type == "FortMainHLOD";
+
+    /// <summary>Whether a landscape piece touches the ground asked for (MPTerrainAreas), by its own extent: the mesh starts at its actor.</summary>
+    private bool InTerrainAreas(ALandscapeProxy proxy)
+    {
+        if (Meta.MPTerrainAreas is not { } areas) return true;
+        int minX = int.MaxValue, minY = int.MaxValue, maxX = int.MinValue, maxY = int.MinValue;
+        foreach (var component in proxy.LandscapeComponents ?? [])
+            component.Load<ULandscapeComponent>()?.GetComponentExtent(ref minX, ref minY, ref maxX, ref maxY);
+        if (minX > maxX) return false;
+        var at = proxy.GetAbsoluteTransformFromRootComponent();
+        var piece = new TerrainArea(at.Translation.X, at.Translation.Y,
+            at.Translation.X + (maxX - minX) * at.Scale3D.X, at.Translation.Y + (maxY - minY) * at.Scale3D.Y);
+        return areas.Any(piece.Overlaps);
+    }
+
+    /// <summary>The level's terrain and HLOD actors, or those of the packages read in its place (MPLevels: an editor
+    /// map's actors, each in its own package, found by class without reading the others).</summary>
+    private IEnumerable<UObject> TerrainActors(ULevel level)
+    {
+        if (Meta.MPLevels is null)
+        {
+            foreach (var actorLazy in level.Actors)
+            {
+                if (actorLazy is null || actorLazy.IsNull) continue;
+                if (!IsTerrain(actorLazy.ResolvedObject?.Class?.Name.Text ?? string.Empty)) continue;
+                if (actorLazy.Load() is { } actor) yield return actor;
+            }
+            yield break;
+        }
+        foreach (var key in Meta.MPLevels)
+        {
+            if (!FileProvider.TryLoadPackage(key, out var loaded) || loaded is not global::CUE4Parse.UE4.Assets.Package package) continue;
+            global::CUE4Parse.UE4.Assets.IPackage lazy = package;
+            for (var i = 0; i < package.ExportMap.Length; i++)
+            {
+                var export = package.ExportMap[i];
+                if (export.OuterIndex is not { IsImport: true } outer || package.ImportMap[-outer.Index - 1].ObjectName.Text != "PersistentLevel") continue;
+                var type = export.ClassIndex.IsImport ? package.ImportMap[-export.ClassIndex.Index - 1].ObjectName.Text : "";
+                if (IsTerrain(type) && lazy.GetExport(i) is { } actor) yield return actor;
+            }
+        }
     }
 
     /// <summary>The _Generated_ cell levels beside a World Partition map whose runtime hash lists none (UEFN islands).</summary>
@@ -201,6 +298,26 @@ public partial class ExportContext
             .OrderBy(k => k, StringComparer.OrdinalIgnoreCase).ToList();
         Log.Information("[Material Porter] {Map}: {Count} island cells beside it", package, cells.Count);
         return cells;
+    }
+
+    private readonly Dictionary<string, Dictionary<string, object>?> _mpGrass = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>A landscape's grass outputs (GrassTypes.Landscape), read once per set of masters.</summary>
+    private Dictionary<string, object>? LandscapeGrass(ExportMesh landscape)
+    {
+        var masters = landscape.Materials.Concat(landscape.OverrideMaterials).Select(m => m.BaseMaterial).OfType<UMaterial>()
+            .DistinctBy(m => m.GetPathName()).ToList();
+        var key = string.Join("|", masters.Select(m => m.GetPathName()));
+        lock (_mpGrass)
+        {
+            if (_mpGrass.TryGetValue(key, out var known)) return known;
+            try { return _mpGrass[key] = GrassTypes.Landscape(FileProvider, masters); }
+            catch (Exception e)
+            {
+                MaterialPorter.Failures.Note("landscape grass", key, e);
+                return _mpGrass[key] = null;
+            }
+        }
     }
 
     /// <summary>A landscape's weight layers: LayerInfo asset name -> LayerName that materials sample.</summary>
@@ -256,6 +373,8 @@ public partial class ExportContext
             AttenuationRadius = l.AttenuationRadius,
             Radius = l.SourceRadius,
             CastShadows = l.CastShadows,
+            MPHidden = l.Hidden ? true : null,
+            MPLayer = l.Layer,
         };
         SetMaterialPorterTransform(export, l.World);
         return export;
@@ -281,6 +400,8 @@ public partial class ExportContext
             SortOrder = d.SortOrder,
             FadeScreenSize = d.FadeScreenSize,
             Material = SlotMaterial(material, 0, d.Params ?? new ParamSet()),
+            MPHidden = d.Hidden ? true : null,
+            MPLayer = d.Layer,
         };
         SetMaterialPorterTransform(export, d.World);
         return export;
@@ -289,7 +410,7 @@ public partial class ExportContext
     /// <summary>One particle system as the world export's record: world transform, system path and user parameters.</summary>
     private static ExportEffect Effect(MapEffect e)
     {
-        var export = new ExportEffect { Name = e.Name, System = e.System, Parameters = e.Parameters };
+        var export = new ExportEffect { Name = e.Name, System = e.System, Parameters = e.Parameters, MPHidden = e.Hidden ? true : null, MPLayer = e.Layer };
         SetMaterialPorterTransform(export, e.World);
         return export;
     }
@@ -306,6 +427,13 @@ public partial class ExportContext
         };
     }
 
+    // A placement whose mesh couldn't be exported: UEFN project code may put something in its place.
+    partial void MissingMesh(MapMesh m, ref ExportMesh? empty);
+
+    // A mesh UEFN project code exports itself (an uncooked one, which has no render data).
+    partial void UefnStaticMesh<T>(UStaticMesh mesh, ref T? export) where T : ExportMesh, new();
+    partial void UefnSkeletalMesh<T>(USkeletalMesh mesh, ref T? export) where T : ExportMesh, new();
+
     /// <summary>One placement as FP's mesh record: the mesh (exported once), its transform and slot materials.</summary>
     private ExportMesh? Placement(MapMesh m)
     {
@@ -319,7 +447,12 @@ public partial class ExportContext
             };
             _mpMeshes[m.Mesh] = template;
         }
-        if (template is null) return null;
+        if (template is null)
+        {
+            ExportMesh? empty = null;
+            MissingMesh(m, ref empty);     // MP: a project mesh's placeholder
+            return empty;
+        }
 
         var export = new MaterialPorterMesh
         {
@@ -331,6 +464,8 @@ public partial class ExportContext
             MPSpline = m.Spline,
             MPCastShadow = m.CastShadow ? null : false,
             MPShadowOnly = m.ShadowOnly ? true : null,
+            MPHidden = m.Hidden ? true : null,
+            MPLayer = m.Layer,
             MPActor = m.Actor,
         };
         export.Materials.AddRange(template.Materials);
@@ -354,6 +489,33 @@ public partial class ExportContext
             export.OverrideMaterials.Add(SlotMaterial(material, slot, values));
         }
         return export;
+    }
+
+    /// <summary>An instanced mesh component's instances as one record at the origin (MPInstances); one placement each when its mesh is a placeholder.</summary>
+    private IEnumerable<ExportMesh> InstanceGroup(List<MapMesh> members)
+    {
+        var first = members[0];
+        if (Placement(first) is not MaterialPorterMesh export) return members.Select(Placement).OfType<ExportMesh>();
+        var floats = first.InstanceData?.Length ?? 0;
+        var transforms = new float[members.Count * 9];
+        var data = floats > 0 ? new float[members.Count * floats] : null;
+        for (var i = 0; i < members.Count; i++)
+        {
+            var (l, r, s) = MaterialPorterTransform(members[i].World);
+            new[] { l.X, l.Y, l.Z, r.Pitch, r.Yaw, r.Roll, s.X, s.Y, s.Z }.CopyTo(transforms, i * 9);
+            members[i].InstanceData?.CopyTo(data!, i * floats);
+        }
+        export.Location = FVector.ZeroVector;
+        export.Rotation = FRotator.ZeroRotator;
+        export.Scale = FVector.OneVector;
+        export.MPInstanceData = null;
+        if (first.Group.PrimitiveData) export.MPPrimitiveData = null;
+        export.MPInstances = new MaterialPorterInstances
+        {
+            Class = first.Group.Class, Component = first.Group.Component, Actor = first.Actor, Count = members.Count,
+            Transforms = transforms, Floats = floats, Data = data, PrimitiveData = first.Group.PrimitiveData,
+        };
+        return [export];
     }
 
     /// <summary>A Rocket Racing car: body with the tier's (or a decal's) material, picked wheels on the wheel sockets, and the Mutable values per material. Picks: channel index -> option index.</summary>
@@ -572,6 +734,11 @@ public partial class ExportContext
     /// <summary>A UE world matrix (row vectors) as FP's location, rotation and scale; a mirror goes into X scale.</summary>
     private static void SetMaterialPorterTransform(ExportObject export, Matrix4x4 world)
     {
+        (export.Location, export.Rotation, export.Scale) = MaterialPorterTransform(world);
+    }
+
+    private static (FVector Location, FRotator Rotation, FVector Scale) MaterialPorterTransform(Matrix4x4 world)
+    {
         var mirrored = world.GetDeterminant() < 0;
         if (mirrored) world = Matrix4x4.CreateScale(-1, 1, 1) * world;
         if (!Matrix4x4.Decompose(world, out var scale, out var rotation, out var translation))
@@ -581,9 +748,8 @@ public partial class ExportContext
             translation = world.Translation;
         }
         if (mirrored) scale.X = -scale.X;
-        export.Location = new FVector(translation.X, translation.Y, translation.Z);
-        export.Rotation = new FQuat(rotation.X, rotation.Y, rotation.Z, rotation.W).Rotator();
-        export.Scale = new FVector(scale.X, scale.Y, scale.Z);
+        return (new FVector(translation.X, translation.Y, translation.Z), new FQuat(rotation.X, rotation.Y, rotation.Z, rotation.W).Rotator(),
+                new FVector(scale.X, scale.Y, scale.Z));
     }
 
     /// <summary>An object by its path, also one nested in a level ("/Map.Map:PersistentLevel.Actor.Component.WaterInfoMesh_0").</summary>

@@ -8,12 +8,13 @@ and FP builds its own preset material.
 import hashlib
 import json
 import os
+import re
 import traceback
 from collections import namedtuple
 
 import bpy
 
-from . import build, fallback
+from . import build, fallback, params
 from .app_client import AppClient, AppError
 from ..logger import Log
 from ..processing.enums import EExportType, ExportCategory
@@ -32,15 +33,24 @@ def _session(context):
     """State of the current import, reset when a new import (context) starts."""
     if _job["key"] is not context:
         build.begin_session()
+        if _job["app"] is not None:
+            _job["app"].close()
         _job.update(key=context, app=AppClient(URL), down=False, built={}, shapes={}, notes=[])
-        # texture size cap (Max / Map Texture Size settings), sent to the app with each texture request
-        options = getattr(context, "options", None) or {}
-        setting = "MapTextureSize" if getattr(context, "type", None) in (EExportType.WORLD, EExportType.PREFAB) else "MaxTextureSize"
-        try:
-            _job["app"].max_texture = int(options.get(setting) or 0)
-        except (TypeError, ValueError):
-            pass
+    # texture size cap (Max / Map Texture Size settings), sent to the app with each texture request; read each time, as
+    # the session can start (material prefetch) before the import's options are set
+    options = getattr(context, "options", None) or {}
+    setting = "MapTextureSize" if getattr(context, "type", None) in (EExportType.WORLD, EExportType.PREFAB) else "MaxTextureSize"
+    try:
+        _job["app"].max_texture = int(options.get(setting) or 0)
+    except (TypeError, ValueError):
+        pass
     return _job
+
+
+def prefetch_materials(context, paths):
+    """Asks the app for the import's materials in the background while meshes import (progress.export_begin)."""
+    if bpy.app.version >= (5, 0, 0) and os.environ.get("MATERIAL_PORTER_PREFETCH") != "0":     # 0: off, for timing
+        _session(context)["app"].prefetch("material", paths)
 
 
 def texture_cap(context):
@@ -50,6 +60,31 @@ def texture_cap(context):
 
 def _log(message):
     Log.info("[Material Porter] " + message)
+
+
+def _outcome(context, text):
+    """Sets the import's line for this material (progress.py); False outside an import."""
+    record = getattr(context, "mp_material", None)
+    if record is not None:
+        record["outcome"] = text
+    return record is not None
+
+
+def _failed(context, name, why):
+    """A material left to FP's: an import's material line says why, elsewhere a line of its own."""
+    if not _outcome(context, "FP shader, not built: " + why):
+        _log("%s: %s - FP's own material" % (name, why))
+
+
+def _notes(context, notes):
+    record = getattr(context, "mp_material", None)
+    for note in notes:
+        if record is None:
+            _log(note)
+        else:       # under the material's line, without its name
+            prefix = "%s: " % record.get("name")
+            record.setdefault("notes", []).append(note[len(prefix):] if note.startswith(prefix) else note)
+    notes.clear()
 
 
 def _digest(text):
@@ -93,6 +128,7 @@ def _built(path, variant):
     # fallbacks (island materials without a graph) from an older fallback builder are rebuilt
     return next((m for m in bpy.data.materials if m.get(build.KEY_PATH) == path
                  and m.get(build.KEY_VARIANT, "") == variant and build.KEY_REPLACES not in m
+                 and "mp_rvt_source" not in m
                  and m.get(build.KEY_REV, 1) >= build.BUILD_REVISION
                  and m.get("mp_fallback", fallback.REVISION) >= fallback.REVISION), None)
 
@@ -183,11 +219,11 @@ def _sampler_limit():
 
 
 def _samplers(mat):
-    """Count the image nodes that reach the material output, through groups (what Eevee binds)."""
-    seen, count = set(), 0
+    """Count the samplers Eevee binds for a material: the images reaching its output, through groups, one per image
+    and filtering (Blender shares a sampler between image nodes reading one image the same way)."""
+    seen, bound = set(), set()
 
     def walk(tree, outs):
-        nonlocal count
         back = {}
         for l in tree.links:
             back.setdefault(l.to_node.name, []).append(l.from_node)
@@ -198,28 +234,120 @@ def _samplers(mat):
                 continue
             done.add(n.name)
             if n.bl_idname == "ShaderNodeTexImage" and n.image is not None:
-                count += 1
+                bound.add((n.image.name, n.interpolation, n.extension))
             elif n.bl_idname == "ShaderNodeGroup" and n.node_tree is not None and n.node_tree.name not in seen:
                 seen.add(n.node_tree.name)
                 walk(n.node_tree, [x for x in n.node_tree.nodes if x.bl_idname == "NodeGroupOutput"])
             todo.extend(back.get(n.name, []))
     walk(mat.node_tree, [n for n in mat.node_tree.nodes if n.bl_idname == "ShaderNodeOutputMaterial"])
-    return count
+    return len(bound)
+
+
+# mesh attributes one Eevee material can read (colour layers, UV maps, tangents): 15 failed to compile, 14 drew
+ATTRIBUTE_LIMIT = 14
+
+
+def _mesh_attributes(mat):
+    """The mesh attributes a material's trees read: colour layers, geometry attributes, UV maps and their tangents."""
+    seen, found = set(), set()
+    todo = [mat.node_tree] if mat and mat.node_tree else []
+    while todo:
+        tree = todo.pop()
+        if tree is None or tree.name in seen:
+            continue
+        seen.add(tree.name)
+        for n in tree.nodes:
+            kind = n.bl_idname
+            if kind == "ShaderNodeGroup":
+                todo.append(n.node_tree)
+            elif kind == "ShaderNodeVertexColor":
+                found.add(("colour", n.layer_name))
+            elif kind == "ShaderNodeAttribute" and n.attribute_type == 'GEOMETRY':
+                found.add(("attribute", n.attribute_name))
+            elif kind == "ShaderNodeUVMap":
+                found.add(("uv", n.uv_map))
+            elif kind == "ShaderNodeNormalMap" and n.space == 'TANGENT':
+                found.add(("tangent", n.uv_map))
+            elif kind == "ShaderNodeTangent" and n.direction_type == 'UV_MAP':
+                found.add(("tangent", n.uv_map))
+    return len(found)
+
+
+_OVER_LIMITS = set()     # (material, map-wide layers) whose shared build went past Eevee's limits
+
+
+def _over_key(base, layers):
+    return base[0], tuple(layers)
+
+
+def built_layers(obj):
+    from .landscape_layers import built
+    return built(obj)
 
 
 def _lightest_layer(obj, layers):
     """The painted layer of a landscape proxy with the least total weight."""
-    import numpy as np
-    total = {}
-    for name in layers:
-        a = obj.data.color_attributes.get(name)
-        if a is None:
-            total[name] = 0.0
-            continue
-        v = np.empty(len(a.data) * 4, dtype=np.float32)
-        a.data.foreach_get("color", v)
-        total[name] = float(v[0::4].sum())
-    return min(layers, key=lambda n: total[n])
+    from .landscape_layers import weight
+    return min(layers, key=lambda n: weight(obj, n))
+
+
+def _drop_layers(job, entry, base, obj, limit, samplers, attributes):
+    """The fewest least-painted layers left out for the material to fit Eevee's limits (at least one layer kept), as
+    dropping them one by one would end, found in a few builds: leaving a layer out never adds samplers or attributes,
+    so a guess from the overshoot, then a binary search. Returns the material built for them."""
+    from .landscape_layers import weight
+    layers = list(entry["landscape_layers"])
+    order = sorted(layers, key=lambda n: weight(obj, n))       # lightest first; stable as min() picked
+    n, built = len(layers), {}
+
+    def build_without(k):
+        if k not in built:
+            gone = set(order[:k])
+            _set_layers(entry, base, obj, [l for l in layers if l not in gone])
+            m = _material(job, entry, obj)
+            fit = not (limit and _samplers(m) > limit) and _mesh_attributes(m) <= ATTRIBUTE_LIMIT
+            built[k] = (m, fit)
+        return built[k][1]
+
+    over = max((samplers - limit) / max(samplers / n, 1) if limit and samplers > limit else 0,
+               (attributes - ATTRIBUTE_LIMIT) / max(attributes / n, 1) if attributes > ATTRIBUTE_LIMIT else 0)
+    guess = min(max(int(-(-over // 1)), 1), n - 1)
+    lo, hi = (1, guess) if build_without(guess) else (guess + 1, n - 1)
+    while lo < hi:      # the fewest that fit in [lo, hi] (n - 1 when none does)
+        mid = (lo + hi) // 2
+        if build_without(mid):
+            hi = mid
+        else:
+            lo = mid + 1
+    build_without(lo)
+    _set_layers(entry, base, obj, [l for l in layers if l not in set(order[:lo])])
+    return built[lo][0]
+
+
+def _set_layers(entry, base, obj, layers):
+    """Build for these layers of a landscape proxy, read from the channels the mesh keeps them in."""
+    from . import landscape_layers
+    from .weightmaps import images
+    packed, maps = landscape_layers.table(obj), images(obj)
+    entry["landscape_world"] = bool(obj.get(landscape_layers.ALL))
+    entry["landscape_layers"] = layers
+    entry["landscape_dropped"] = sorted(set(landscape_layers.layers(obj)) - set(layers)) if entry["landscape_world"] else []
+    entry["landscape_channels"] = {l: list(packed[l]) for l in layers if l in packed and packed[l][0] not in maps}
+    entry["landscape_images"] = {l: [maps[packed[l][0]].name, packed[l][1]] for l in layers
+                                 if l in packed and packed[l][0] in maps}
+    # map-wide textures the meshes paint themselves (biome maps): parameter -> image
+    entry["biome_maps"] = {k: v for k, v in dict(obj.get("mp_biome_maps") or {}).items() if bpy.data.images.get(v)}
+    # their rectangles, as the material built before worked them out (ue_graph.maptex.finish)
+    known = json.loads((obj.active_material or {}).get("mp_map_textures") or "{}") if obj.active_material else {}
+    entry["biome_rects"] = {k: known[k]["rects"] for k in entry["biome_maps"] if k in known}
+    # a colour map following the painted masks (biome_colours): mixed in the shader
+    from . import biome_colours
+    entry["biome_follow"] = biome_colours.config(obj, known)
+    entry["name"] = "%s (%s)" % (base[1], "+".join(layers) if layers else "no layers")
+    entry["variant"] = _digest("%s layers %s%s %s %s" % (base[0], landscape_layers.key(obj, layers),
+                                                      " world" if entry["landscape_world"] else "",
+                                                      sorted(entry["biome_maps"].items()),
+                                                      json.dumps(entry["biome_follow"], sort_keys=True)))
 
 
 def build_exact(context, material_data, texture_data=None, override_parameters=None, obj=None):
@@ -228,6 +356,7 @@ def build_exact(context, material_data, texture_data=None, override_parameters=N
         return None
     job = _session(context)
     if job["down"]:
+        _outcome(context, "FP shader, the app isn't answering")
         return None
     build.mark_bounds([obj] if obj else [])     # UE's Object Position is per object even for a shared material
     path = material_data.get("Path")
@@ -239,8 +368,9 @@ def build_exact(context, material_data, texture_data=None, override_parameters=N
         if "isn't answering" in str(e):
             job["down"] = True
             _log("the FP app's bridge isn't answering at %s: FP's own materials this import" % URL)
+            _outcome(context, "FP shader, the app isn't answering")
         else:
-            _log("%s: %s - FP's own material" % (material_data.get("Name"), e))
+            _failed(context, material_data.get("Name"), str(e))
         return None
     overlay = _overlay(texture_data, override_parameters, material_data.get("MPValues"))
     # rebuilding a material (wrap.py): reapply the values it was built with
@@ -265,9 +395,14 @@ def build_exact(context, material_data, texture_data=None, override_parameters=N
         for kind, values in overlay.items():
             entry[kind] = dict(entry.get(kind) or {}, **values)
         entry["variant"] = _digest(json.dumps(overlay, sort_keys=True))
+    # Rebuild On (rebase.py): another game material's shader with the material's own values
+    if rebased := material_data.get("MPRebase"):
+        from . import rebase
+        rebase.onto(entry, job["app"].get("material", rebased))
     # textures capped smaller (Max / Map Texture Size): a material of its own, never shared with full-size ones
     if cap := texture_cap(context):
         entry["variant"] = _digest("%s cap%d" % (entry.get("variant", ""), cap))
+        entry["cap"] = cap      # and a shape of its own: build_like shares the images it doesn't swap
     # flipbook sprite: UV0 is the sub-image the particle shows (env.uv)
     if sprite := material_data.get("MPSprite"):
         entry["sprite"] = [float(x) for x in sprite]
@@ -284,9 +419,10 @@ def build_exact(context, material_data, texture_data=None, override_parameters=N
     if material_data.get("MPMoves"):
         entry["moves"] = True
         entry["variant"] = _digest("%s moves" % entry.get("variant", ""))
-    # a face that swaps its pieces by the face's curves (Peely's eyes and brows): World Position Offset folds the unused
-    # ones away (build hides them)
-    elif any(str(x.get("Name", "")).lower().endswith("_pose") for x in material_data.get("Scalars") or []):
+    # a face that swaps its pieces by the face's curves (Peely's eyes and brows) or by eye and brow indices (WartyBrine's):
+    # World Position Offset folds the unused ones away (build hides them)
+    elif any(re.search(r"_pose$|^flipbook_face_[lr]_(eye|brow)_index$", str(x.get("Name", "")).lower())
+             for x in material_data.get("Scalars") or []):
         entry["folds"] = True
         entry["variant"] = _digest("%s folds" % entry.get("variant", ""))
     # import's subsurface values (fur its own); a cosmetic's materials get the controls even where the game doesn't scatter
@@ -303,36 +439,46 @@ def build_exact(context, material_data, texture_data=None, override_parameters=N
     # (the Ch4 jungle landscape samples 43 textures over all layers, past Eevee's 32, and rendered magenta)
     landscape_base = (entry.get("variant", ""), entry["name"])
     if obj is not None and obj.type == 'MESH' and obj.get("mp_landscape"):
-        layers = sorted(a.name for a in obj.data.color_attributes if a.name != "COL0")
-        entry["landscape_layers"] = layers
-        entry["name"] = "%s (%s)" % (landscape_base[1], "+".join(layers) if layers else "no layers")
-        entry["variant"] = _digest("%s layers %s" % (landscape_base[0], " ".join(layers)))
+        # all of a map's layers (one material for its proxies), the painted ones (a map past Eevee's limits with all
+        # of them), or all on a mesh a material was put on (to paint)
+        from .landscape_layers import MAP, built, painted
+        layers = built(obj)
+        if obj.get(MAP) and _over_key(landscape_base, layers) in _OVER_LIMITS:
+            layers = painted(obj)
+        _set_layers(entry, landscape_base, obj, layers)
     # lay out each tree when a node editor first shows it (two fifths of build time, cosmetic)
     build.LAZY_LAYOUT = True
     try:
         mat = _material(job, entry, obj)
-        # On OpenGL Eevee limits image samplers per material (past it: magenta). A proxy still over the limit
-        # drops its least painted layer, repeatedly.
+        # Eevee limits image samplers per material on OpenGL, and mesh attributes read on every backend (past either:
+        # magenta). A proxy still over a limit drops its least painted layer, repeatedly.
         limit = _sampler_limit() if entry.get("landscape_layers") else None
-        while limit and len(entry["landscape_layers"]) > 1 and (samplers := _samplers(mat)) > limit:
-            lightest = _lightest_layer(obj, entry["landscape_layers"])
-            layers = [l for l in entry["landscape_layers"] if l != lightest]
-            _log("%s: %d image samplers over Eevee's %d on OpenGL - its least painted layer left out" % (
-                entry["name"], samplers, limit))
-            entry["landscape_layers"] = layers
-            entry["name"] = "%s (%s)" % (landscape_base[1], "+".join(layers))
-            entry["variant"] = _digest("%s layers %s" % (landscape_base[0], " ".join(layers)))
-            mat = _material(job, entry, obj)
+        while entry.get("landscape_layers") and len(entry["landscape_layers"]) > 1:
+            samplers, attributes = _samplers(mat), _mesh_attributes(mat)
+            if not (limit and samplers > limit) and attributes <= ATTRIBUTE_LIMIT:
+                break
+            from .landscape_layers import MAP, painted
+            shared = obj.get(MAP) and _over_key(landscape_base, entry["landscape_layers"]) not in _OVER_LIMITS \
+                and entry["landscape_layers"] == built_layers(obj)
+            if shared:      # the map-wide build doesn't fit: this material builds per proxy's painted layers from now on
+                _OVER_LIMITS.add(_over_key(landscape_base, entry["landscape_layers"]))
+                layers = painted(obj) or entry["landscape_layers"][:1]
+                _set_layers(entry, landscape_base, obj, layers)
+                mat = _material(job, entry, obj)
+                continue
+            _log("%s: %s - its least painted layers left out" % (entry["name"], (
+                "%d image samplers over Eevee's %d on OpenGL" % (samplers, limit)) if limit and samplers > limit else
+                "%d mesh attributes over Eevee's %d" % (attributes, ATTRIBUTE_LIMIT)))
+            mat = _drop_layers(job, entry, landscape_base, obj, limit, samplers, attributes)
+            break
     except Exception as e:
         at = traceback.extract_tb(e.__traceback__)[-1]
-        _log("%s: not built (%s: %s, at %s:%d) - FP's own material" % (
-            material_data.get("Name"), type(e).__name__, e, os.path.basename(at.filename), at.lineno))
+        _failed(context, material_data.get("Name"), "%s: %s, at %s:%d" % (
+            type(e).__name__, e, os.path.basename(at.filename), at.lineno))
         return None
     finally:
         build.LAZY_LAYOUT = False
-    for note in job["notes"]:
-        _log(note)
-    job["notes"].clear()
+    _notes(context, job["notes"])
     if build.KEY_SUBSURFACE in mat:
         # the root group node is the only one in its tree with those inputs
         values = {build.SKIN_SUBSURFACE_INPUT: sss.skin, build.SUBSURFACE_INTENSITY: sss.skin,
@@ -343,6 +489,15 @@ def build_exact(context, material_data, texture_data=None, override_parameters=N
                 for name, v in values.items():
                     if name in n.inputs:
                         n.inputs[name].default_value = v
+    if material_data.get("MPOutline"):
+        params.add_feature(mat, "Outline")
+    if rebased:
+        mat["mp_rebase"] = rebased
+        params.add_feature(mat, "Rebuilt On " + rebased.rsplit("/", 1)[-1].split(".")[0])
+    if params.KEY_GAME not in mat:      # a new build: what Reset to game goes back to
+        params.snapshot(mat)
+        params.carry_overrides(mat)
+    params.apply_overrides(mat)         # last: over the import's own subsurface values
     # LEGO face: rig placement of the character accents per mouth pose (face_anim.py)
     if rig := material_data.get("MPFaceRig"):
         mat["mp_face_rig"] = rig

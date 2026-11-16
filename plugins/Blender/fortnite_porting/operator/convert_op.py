@@ -11,11 +11,14 @@ import types
 
 import bpy
 
-from ..material_porter import build, hook
+from ..material_porter import build, effects, hook
 from ..material_porter.app_client import AppClient, AppError
+from . import menus
 
 # Names per find-materials request (they go in the URL).
 CHUNK = 40
+# armature data keys of the rigs the add-on builds (and Tasty's)
+RIGGED = ("is_creature_rig", "is_vehicle_rig", "is_lego_rig", "is_tasty", "fpmp_official_rig")
 
 
 def _asset_name(mat):
@@ -64,6 +67,51 @@ def _pick(app, mat, paths):
     return best
 
 
+def _effect_root(obj):
+    """The replayable effect the object is part of, found from its keys and parents only (no scene walk), or None."""
+    if obj is None or obj.get(effects.KEY) is None:
+        return None
+    from ..material_porter.effect_replay import KEY_PROGRAM, KEY_ROOT
+    at = obj.get(KEY_ROOT) if obj.get(effects.KEY) == "Particles" else obj
+    while at is not None and at.get(effects.KEY) != "System":
+        at = at.parent
+    return at if at is not None and at.get(KEY_PROGRAM) else None
+
+
+def _effect_roots(obj):
+    """The replayable effects the object is part of, else the ones it holds (a pickaxe's trail), with no scene walk."""
+    from ..material_porter import effect_replay
+    root = _effect_root(obj)
+    return [root] if root is not None else effect_replay.held(obj)
+
+
+def _plain_armature(cls, context):
+    """The active armature when it has no rig yet and its data can change, else None (with the poll's message)."""
+    obj = context.active_object
+    if obj is None or obj.type != 'ARMATURE':
+        cls.poll_message_set("Select an armature")
+        return None
+    if not obj.data.is_editable:
+        cls.poll_message_set("The armature's data is linked: make it local first")
+        return None
+    if any(obj.data.get(k) for k in RIGGED):
+        cls.poll_message_set("The armature has a rig already")
+        return None
+    return obj
+
+
+def _has_wheels(obj):
+    """Wheel bones by the vehicle rig's names (tire, wheel_disc, rot_road_wheel...)."""
+    from ..processing.context import vehicle_rig as v
+    return any(v.SPIN.search(n) or (v.WHEELISH.search(n) and not v.NOT_A_WHEEL.search(n)) for n in obj.data.bones.keys())
+
+
+def _is_creature(obj):
+    """A skeleton no other rig fits: not humanoid (the official rig's), a LEGO figure's or a vehicle's."""
+    from ..processing.context import lego_rig, official_rig
+    return len(obj.data.bones) > 0 and not official_rig.fits(obj) and not lego_rig.fits(obj) and not _has_wheels(obj)
+
+
 class FPMP_OT_ConvertExact(bpy.types.Operator):
     """Rebuild the FP materials of these objects as the fork's exact materials (the FP app must be running)"""
     bl_idname = "fpmp.convert_exact"
@@ -79,10 +127,14 @@ class FPMP_OT_ConvertExact(bpy.types.Operator):
         name="Rim Light", default=False,
         description="Keep the rim light of Fortnite's character materials (as the Blender export setting)")
 
-    def execute(self, context):
+    @classmethod
+    def poll(cls, context):
         if bpy.app.version < (5, 0, 0):
-            self.report({'ERROR'}, "Exact materials need Blender 5.0 or newer")
-            return {'CANCELLED'}
+            cls.poll_message_set("Exact materials need Blender 5.0 or newer")
+            return False
+        return context.mode == 'OBJECT'
+
+    def execute(self, context):
         objects = context.selected_objects if self.scope == 'SELECTED' else context.scene.objects
         # FP material -> its (object, slot index) users
         slots = {}
@@ -148,6 +200,13 @@ class FPMP_OT_RemoveWrap(bpy.types.Operator):
     bl_label = "Remove Wrap"
     bl_options = {'REGISTER', 'UNDO'}
 
+    @classmethod
+    def poll(cls, context):
+        if not context.selected_objects:
+            cls.poll_message_set("Select the wrapped objects")
+            return False
+        return context.mode == 'OBJECT'
+
     def execute(self, context):
         from ..material_porter import wrap
         job = types.SimpleNamespace(options={'RimLight': False}, type=types.SimpleNamespace(name='MESH'))
@@ -166,6 +225,13 @@ class FPMP_OT_ReplayEffect(bpy.types.Operator):
     bl_idname = "fpmp.replay_effect"
     bl_label = "Replay Effect"
     bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        if not _effect_roots(context.active_object) and not any(_effect_roots(o) for o in context.selected_objects):
+            cls.poll_message_set("Select an imported effect (its empty, anything under it, or what holds it)")
+            return False
+        return True
 
     def execute(self, context):
         from ..material_porter import effect_replay
@@ -192,12 +258,37 @@ class FPMP_OT_CreatureRig(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == 'ARMATURE' and not obj.data.get("is_creature_rig") and not obj.data.get("is_tasty") and not obj.data.get("is_lego_rig")
+        obj = _plain_armature(cls, context)
+        if obj is not None and not _is_creature(obj):
+            cls.poll_message_set("A humanoid, LEGO figure or vehicle skeleton: use its own rig")
+            return False
+        return obj is not None
 
     def execute(self, context):
         from ..processing.context.creature_rig import create
         self.report({'INFO'}, create(context.active_object))
+        return {'FINISHED'}
+
+
+class FPMP_OT_OfficialRig(bpy.types.Operator):
+    """Give the selected humanoid armature Fortnite's official rig (FK / IK limbs, the picker's controls), as the
+    import does with the Official rig type"""
+    bl_idname = "fpmp.official_rig"
+    bl_label = "Official Rig"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        from ..processing.context import official_rig
+        obj = _plain_armature(cls, context)
+        if obj is not None and not official_rig.fits(obj):
+            cls.poll_message_set("Not a humanoid skeleton (pelvis, spine, arms, legs)")
+            return False
+        return obj is not None
+
+    def execute(self, context):
+        from ..processing.context import official_rig
+        self.report({'INFO'}, official_rig.create(context.active_object))
         return {'FINISHED'}
 
 
@@ -210,8 +301,11 @@ class FPMP_OT_VehicleRig(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == 'ARMATURE' and not obj.data.get("is_vehicle_rig") and not obj.data.get("is_creature_rig") and not obj.data.get("is_tasty") and not obj.data.get("is_lego_rig")
+        obj = _plain_armature(cls, context)
+        if obj is not None and not _has_wheels(obj):
+            cls.poll_message_set("No wheel bones in this skeleton")
+            return False
+        return obj is not None
 
     def execute(self, context):
         from ..processing.context.vehicle_rig import create
@@ -229,8 +323,11 @@ class FPMP_OT_LegoRig(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         from ..processing.context import lego_rig
-        obj = context.active_object
-        return lego_rig.fits(obj) and not obj.data.get("is_lego_rig")
+        obj = _plain_armature(cls, context)
+        if obj is not None and not lego_rig.fits(obj):
+            cls.poll_message_set("Not a LEGO figure's skeleton")
+            return False
+        return obj is not None
 
     def execute(self, context):
         from ..processing.context.lego_rig import create
@@ -273,6 +370,26 @@ class FPMP_OT_RestoreLandscape(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class FPMP_OT_BakeRVT(bpy.types.Operator):
+    """Bake what the selected landscapes (none selected: all) write to the game's runtime virtual texture, which
+    grass and rocks on them read for the ground's colour. Run it again after repainting"""
+    bl_idname = "fpmp.bake_rvt"
+    bl_label = "Bake Landscape Colour"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        from ..material_porter import rvt
+        return any(rvt.writes(o) for o in context.scene.objects)
+
+    def execute(self, context):
+        from ..material_porter import rvt
+        picked = [o for o in context.selected_objects if rvt.writes(o)]
+        done = rvt.bake(picked or None)
+        self.report({'INFO'}, "Landscape colour: %d object(s) baked, %d x %d px" % (done["objects"], *done.get("size", (0, 0))))
+        return {'FINISHED'}
+
+
 class FPMP_OT_RoadFromCurve(bpy.types.Operator):
     """Run the selected road segment mesh along the active curve, the way Fortnite's road splines repeat one segment
     (select the segment, then the curve last)"""
@@ -299,30 +416,52 @@ class FPMP_OT_RoadFromCurve(bpy.types.Operator):
 
 
 class FPMP_PT_Exact(bpy.types.Panel):
-    bl_label = "Exact Materials"
+    """FP imports rebuilt as exact materials, and the scene's material switches"""
+    bl_label = "Materials"
     bl_idname = "FPMP_PT_exact"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Fortnite Porting"
+    bl_order = 10
+
+    def draw_header_preset(self, context):
+        # the first panel of the tab: which plugin is loaded, for bug reports
+        from ..material_porter.version_label import version_label
+        self.layout.label(text=version_label())
+
+    def draw(self, context):
+        layout = self.layout
+        # the label column of use_property_split (0.4), so the checkbox below lines up
+        split = layout.split(factor=0.4)
+        split.label(text="Exact Materials")
+        row = split.row(align=True)
+        row.operator(FPMP_OT_ConvertExact.bl_idname, text="Selected").scope = 'SELECTED'
+        row.operator(FPMP_OT_ConvertExact.bl_idname, text="Scene").scope = 'SCENE'
+        row.menu(menus.FPMP_MT_ExactSpecials.bl_idname, text="", icon='DOWNARROW_HLT')
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.prop(context.scene, "fpmp_animated_materials")
+
+
+class FPMP_PT_Effect(bpy.types.Panel):
+    """The active effect's replay: again over the frame range or on a character, and its timing"""
+    bl_label = "Effect"
+    bl_idname = "FPMP_PT_effect"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Fortnite Porting"
+    bl_order = 2
+
+    @classmethod
+    def poll(cls, context):
+        return bool(_effect_roots(context.active_object))
 
     def draw(self, context):
         col = self.layout.column(align=True)
-        col.label(text="Rebuild FP materials exactly:")
-        row = col.row(align=True)
-        row.operator(FPMP_OT_ConvertExact.bl_idname, text="Selected").scope = 'SELECTED'
-        row.operator(FPMP_OT_ConvertExact.bl_idname, text="Scene").scope = 'SCENE'
-        # Wraps are applied in the app (Wrap list on a weapon/vehicle page); removed here.
-        col.separator()
-        col.operator(FPMP_OT_RemoveWrap.bl_idname, text="Remove Wrap from Selected")
-        # Effects replay at import; this replays them on a character or another frame range.
-        col.separator()
-        col.operator(FPMP_OT_ReplayEffect.bl_idname, text="Replay Effect")
-        from ..material_porter.material_time import is_animated
-        on = is_animated(context.scene)
-        col.operator(FPMP_OT_MaterialAnimation.bl_idname, text="Animated Materials", icon='TIME', depress=on).on = not on
-        col.separator()
-        col.operator(FPMP_OT_RoadFromCurve.bl_idname, icon='CURVE_PATH')
-        col.operator(FPMP_OT_RestoreLandscape.bl_idname, icon='MOD_REMESH')
+        col.operator(FPMP_OT_ReplayEffect.bl_idname, icon='PLAY')
+        roots = _effect_roots(context.active_object)
+        for root in roots:
+            col.prop(root, "fpmp_effect_offset", text="Offset" if len(roots) == 1 else root.name)
 
 
 class FPMP_OT_AddShellFur(bpy.types.Operator):
@@ -376,37 +515,65 @@ class FPMP_PT_ShellFur(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Fortnite Porting"
+    bl_order = 3
 
     @classmethod
     def poll(cls, context):
-        return context.active_object is not None and context.active_object.type == 'MESH'
+        from ..material_porter import custom_fur
+        obj = context.active_object
+        return obj is not None and obj.type == 'MESH' and (obj.mode == 'EDIT' or custom_fur.MODIFIER in obj.modifiers)
 
     def draw(self, context):
         from ..material_porter import custom_fur
-        col = self.layout.column(align=True)
-        col.operator(FPMP_OT_AddShellFur.bl_idname, icon='ADD')
-        if custom_fur.draw_inputs(self.layout, context.active_object):
-            self.layout.operator(FPMP_OT_RemoveShellFur.bl_idname, icon='X')
+        obj = context.active_object
+        layout = self.layout
+        if obj.mode == 'EDIT':
+            layout.operator(FPMP_OT_AddShellFur.bl_idname, icon='ADD')
+        if custom_fur.MODIFIER in obj.modifiers:
+            custom_fur.draw_inputs(layout, obj)
+            if obj.mode == 'OBJECT':        # Remove needs Object Mode: hidden, not greyed
+                layout.operator(FPMP_OT_RemoveShellFur.bl_idname, icon='X')
 
 
-classes = (FPMP_OT_ConvertExact, FPMP_OT_RemoveWrap, FPMP_OT_ReplayEffect, FPMP_OT_MaterialAnimation, FPMP_OT_RoadFromCurve, FPMP_OT_RestoreLandscape, FPMP_PT_Exact, FPMP_OT_CreatureRig, FPMP_OT_VehicleRig, FPMP_OT_LegoRig,
+def _get_animated(scene):
+    from ..material_porter import material_time
+    return material_time.is_animated(scene)
+
+
+def _set_animated(scene, on):
+    from ..material_porter import material_time
+    material_time.set_animated(on, scene)
+
+
+classes = (FPMP_OT_ConvertExact, FPMP_OT_RemoveWrap, FPMP_OT_ReplayEffect, FPMP_OT_MaterialAnimation, FPMP_OT_BakeRVT, FPMP_OT_RoadFromCurve, FPMP_OT_RestoreLandscape, FPMP_PT_Effect, FPMP_PT_Exact, FPMP_OT_CreatureRig, FPMP_OT_OfficialRig, FPMP_OT_VehicleRig, FPMP_OT_LegoRig,
            FPMP_OT_AddShellFur, FPMP_OT_RemoveShellFur, FPMP_PT_ShellFur)
 
 
 def _owner_panels():
-    """Panels of the owner-only overlay; empty when it isn't packed in."""
+    """The Fortnite editor (Blender 5.2 and up: the only version it has run on), then the owner overlay's panels."""
+    found = []
+    if bpy.app.version >= (5, 2, 0):
+        from . import fortnite_editor
+        found.append(fortnite_editor)
     try:
         from ..material_porter import tod_panel
+        found.append(tod_panel)
     except ImportError:
-        return []
-    return [tod_panel]
+        pass
+    return found
 
 
 def register():
     from ..processing.context import vehicle_rig
     from . import rig_ui
+    from . import landscape_paint
     for c in classes:
         bpy.utils.register_class(c)
+    bpy.types.Scene.fpmp_animated_materials = bpy.props.BoolProperty(
+        name="Animated Materials", description=FPMP_OT_MaterialAnimation.bl_description,
+        get=_get_animated, set=_set_animated, options=set())
+    menus.register()
+    landscape_paint.register()
     rig_ui.register()
     vehicle_rig.register()          # registers the armature's fpmp_ground property
     for m in _owner_panels():
@@ -424,5 +591,9 @@ def unregister():
     vehicle_rig.unregister()
     from . import rig_ui
     rig_ui.unregister()
+    from . import landscape_paint
+    landscape_paint.unregister()
+    menus.unregister()
+    del bpy.types.Scene.fpmp_animated_materials
     for c in reversed(classes):
         bpy.utils.unregister_class(c)

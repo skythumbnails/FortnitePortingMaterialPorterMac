@@ -28,6 +28,8 @@ from .core import (
     linked,
     load_graph,
 )
+from .edits import holds
+from . import twins
 from .statics import StaticsMixin
 from .attributes import AttributesMixin
 from .maths import MathsMixin
@@ -46,12 +48,16 @@ class Translator(StaticsMixin, AttributesMixin, MathsMixin, GeometryMixin, Rende
         self.call_sites = {}
         self.shared_calls = set()       # names of the call nodes more than one output reads
         self.graphs = parent.graphs if parent else {}
+        # RVT outputs read while a VirtualTextureFeatureSwitch translates its Yes side (statics), functions included
+        self.rvt_reads = parent.rvt_reads if parent else []
         # material functions become shared node groups (env.nest_functions)
         self.functions = parent.functions if parent else {}
+        self.twins = parent.twins if parent else None     # twins.Session while build_one builds
         # Material Attributes a function's group passes in and out: CARRIED, plus what this
         # material's build reads besides (a moving one's World Position Offset)
         self.carried = parent.carried if parent else CARRIED
         self.function = None
+        self.placing = parent.placing if parent else None      # edits.Placing while a build holds locations back
         self.x, self.y = x0, y0
         self.warnings = []
         # layout section new nodes go in (layout): the material, then one frame
@@ -96,12 +102,16 @@ class Translator(StaticsMixin, AttributesMixin, MathsMixin, GeometryMixin, Rende
     # ------------------------------------------------------------- nodes
     def node(self, kind, label="", **props):
         n = self.N.new(kind)
-        n.location = (self.x, self.y)
+        if self.placing is not None and self.placing.trees is not None:
+            self.placing.add(self.tree, n, self.x, self.y)
+        else:
+            n.location = (self.x, self.y)
         self.y -= 30
         n.label = label
         n[SECTION_KEY] = "/".join(self.section)
         for k, v in props.items():
-            setattr(n, k, v)
+            if not holds(getattr(n, k), v):
+                setattr(n, k, v)
         return n
 
     def reuse(self, key, make):
@@ -119,7 +129,8 @@ class Translator(StaticsMixin, AttributesMixin, MathsMixin, GeometryMixin, Rende
         if val is None:
             return
         if isinstance(val.s, (Attrs, TexRef)):
-            self.warnings.append("%s can't go into a socket (%s)" % (type(val.s).__name__, sock.name))
+            self.warnings.append("%s can't go into a socket (%s of %s in %s)" % (
+                type(val.s).__name__, sock.name, sock.node.label or sock.node.name, sock.id_data.name))
             return
         if val.const:
             v = val.s
@@ -129,9 +140,10 @@ class Translator(StaticsMixin, AttributesMixin, MathsMixin, GeometryMixin, Rende
                 v = tuple(v)[:3]
                 if sock.type == 'RGBA':
                     v = v + (1.0,)
+            elif not isinstance(v, (int, float)):
+                v = v[0]
+            if not holds(sock.default_value, v):
                 sock.default_value = v
-            else:
-                sock.default_value = v if isinstance(v, (int, float)) else v[0]
         else:
             self.L.new(val.s, sock)
 
@@ -149,8 +161,9 @@ class Translator(StaticsMixin, AttributesMixin, MathsMixin, GeometryMixin, Rende
         return Val(v + (0.0,) * (3 - len(v)) if len(v) < 3 else v[:3], w or len(v))
 
     def math(self, op, a, b=None, c=None, clamp=False, label=""):
-        if a.const and (b is None or b.const) and (c is None or c.const) and not clamp and op in PY:
-            return Val(PY[op](a.s, None if b is None else b.s), 1)
+        if a.const and (b is None or b.const) and (c is None or c.const) and op in PY and isinstance(a.s, (int, float))                 and (b is None or isinstance(b.s, (int, float))):
+            r = PY[op](a.s, None if b is None else b.s)
+            return Val(min(max(r, 0.0), 1.0) if clamp else r, 1)
         if b is not None and c is None and not clamp:
             # x * 0, x * 1, x + 0, x - 0: known without a node (a weight of 0 drops its term)
             ka = a.s if a.const else None
@@ -425,6 +438,8 @@ class Translator(StaticsMixin, AttributesMixin, MathsMixin, GeometryMixin, Rende
         g = self.graphs.get(path)
         if g is None:
             g = self.graphs[path] = load_graph(path)
+        if self.function is not None:
+            twins.graph_read(self, path)
         return g
 
     def material_output(self, path, prop):
@@ -437,11 +452,15 @@ class Translator(StaticsMixin, AttributesMixin, MathsMixin, GeometryMixin, Rende
         pass-throughs or constants)."""
         import bpy
         while True:
-            dead = [k for k, ft in self.functions.items() if ft.tree.users == 0]
+            # a reused group's users here are this material's nodes (its twin had no others)
+            here = twins.users_here(self) if any(ft.reused for ft in self.functions.values()) else {}
+            dead = [k for k, ft in self.functions.items()
+                    if (here.get(ft.tree.as_pointer(), 0) if ft.reused else ft.tree.users) == 0]
             if not dead:
                 return
             # one pass over the file for all of them (a removal each walked every datablock)
-            bpy.data.batch_remove([self.functions.pop(k).tree for k in dead])
+            gone = [self.functions.pop(k) for k in dead]
+            bpy.data.batch_remove([ft.placeholder if ft.reused else ft.tree for ft in gone])
 
     def material_attributes(self, path, names=CARRIED):
         """A material's attributes Blender has a slot for, {name: Val}: from its
@@ -449,6 +468,12 @@ class Translator(StaticsMixin, AttributesMixin, MathsMixin, GeometryMixin, Rende
         g = self.graph(path)
         pins = (g.editor_data() or {}).get("Properties") or {}
         self.carried = tuple(CARRIED) + tuple(n for n in names if n not in CARRIED)
+        # a material that writes the virtual texture it reads (Fortnite's landscapes on PC): the read is its own output
+        self.rvt_output = (g, next((x for x in g.o if T(x) == "RuntimeVirtualTextureOutput"), None))
+        if self.rvt_output[1] is None:
+            self.rvt_output = None
+        else:
+            self.env.writes_rvt = True     # (its functions' samples too: no baked lookup of itself)
         if linked(pins.get("MaterialAttributes")):
             v = self.input(g, pins["MaterialAttributes"], {}, None)
             attrs = v.s if v is not None and isinstance(v.s, Attrs) else Attrs()
@@ -475,6 +500,14 @@ class Translator(StaticsMixin, AttributesMixin, MathsMixin, GeometryMixin, Rende
             out[n] = self.input(g, pins[pin], {}, None) if pin else attribute_default(n)
         out.update(self.water_outputs(g))
         return out
+
+    def rvt_base_color(self):
+        """What the material writes to its runtime virtual texture's Base Color (None when it writes none); the same
+        nodes as its own read of it."""
+        if not getattr(self, "rvt_output", None):
+            return None
+        rg, rx = self.rvt_output
+        return self.input(rg, (rx.get("Properties") or {}).get("BaseColor"), {}, None)
 
     @contextlib.contextmanager
     def normal_pass(self):
@@ -692,14 +725,14 @@ class Translator(StaticsMixin, AttributesMixin, MathsMixin, GeometryMixin, Rende
         if t == "CameraPositionWS":
             return env.camera_position()
         if t == "SphereMask":
-            # UMaterialExpressionSphereMask::Compile: hardness in percent
+            # UMaterialExpressionSphereMask::Compile: a linked hardness is 0..1, the HardnessPercent constant in percent
             a, b = P("A"), P("B")
             radius = self.input(g, p.get("Radius"), scope, self.const(float(p.get("AttenuationRadius", 256.0))))
-            hard = self.input(g, p.get("Hardness"), scope, self.const(float(p.get("HardnessPercent", 100.0))))
+            hard = self.input(g, p.get("Hardness"), scope, self.const(float(p.get("HardnessPercent", 100.0)) * 0.01))
             d = self.vmath('LENGTH', self.vmath('SUBTRACT', *self.flat(a, b), out_w=3), out_w=1) if max(a.w, b.w) > 1 \
                 else self.math('ABSOLUTE', self.binop('SUBTRACT', a, b))
             nd = self.binop('DIVIDE', d, self.math('MAXIMUM', radius, self.const(0.00001)))
-            soft = self.binop('SUBTRACT', self.const(1.0), self.binop('MULTIPLY', hard, self.const(0.01)))
+            soft = self.binop('SUBTRACT', self.const(1.0), hard)
             inv = self.binop('DIVIDE', self.const(1.0), self.math('MAXIMUM', soft, self.const(0.00001)))
             return self.math('MULTIPLY', self.binop('SUBTRACT', self.const(1.0), nd), inv, clamp=True, label="SphereMask")
         if t == "InverseLinearInterpolate":
@@ -719,7 +752,8 @@ class Translator(StaticsMixin, AttributesMixin, MathsMixin, GeometryMixin, Rende
         if t in ("TextureObject", "TextureObjectParameter"):
             tex = str((p.get("Texture") or {}).get("ObjectName", "")) if isinstance(p.get("Texture"), dict) \
                 else str(p.get("Texture", ""))
-            return Val(TexRef(self.tex_param(p, self.tex_key(p.get("Texture"))), "Volume" in tex), 0)
+            return Val(TexRef(self.tex_param(p, self.tex_key(p.get("Texture"))), "Volume" in tex,
+                              str(p.get("SamplerType", "")), "Texture2DArray" in tex), 0)
         if t == "TextureCoordinate":
             uv = env.uv(int(p.get("CoordinateIndex", 0)))
             ut, vt = float(p.get("UTiling", 1.0)), float(p.get("VTiling", 1.0))
@@ -800,21 +834,45 @@ class Translator(StaticsMixin, AttributesMixin, MathsMixin, GeometryMixin, Rende
             tname = self.tex_param(p, self.tex_key(p.get("Texture")))
             coords = self.input(g, p.get("Coordinates"), scope, None)
             ref = self.input(g, p.get("TextureObject"), scope, None)
-            volume = "VolumeTexture" in tex
+            volume, array = "VolumeTexture" in tex, "Texture2DArray" in tex
             if ref is not None and isinstance(ref.s, TexRef):
-                tname, volume = ref.s.name, ref.s.volume or volume
+                tname, volume, array = ref.s.name, ref.s.volume or volume, ref.s.array or array
+                # UE samples a texture object with the object's sampler type (GetTextureForExpression):
+                # a Color-typed sample of a Normal object still unpacks the normal
+                p = dict(p, SamplerType=ref.s.sampler)
             if volume:
                 return self.sample_volume(tname, coords, out)
             if "TextureCube" in tex:
                 return self.sample_cube(tname, coords if coords is not None else self.reflection(), out)
             if coords is None:
                 coords = env.uv(0)
-            # its own sampler (the default source) filters and addresses as the texture says; a
-            # shared sampler (world group settings) wraps or clamps as its group does
-            src = str(p.get("SamplerSource", "")).split("::")[-1]
-            own = src in ("", "SSM_FromTextureAsset")
-            address = None if own else ("Clamp", "Clamp") if "Clamp" in src or "Terrain" in src else ("Wrap", "Wrap")
-            return self.sample(tname, coords, out, p.get("SamplerType", ""), own, address)
+            param = getattr(tname, "param", None) or p.get("ParameterName")
+            if param and (getattr(env, "entry", None) or {}).get("landscape_world"):
+                # a map-wide texture on a mesh a landscape material was put on (maptex): recorded, and read from
+                # the mesh's own painted map where it has one
+                from . import maptex
+                found = maptex.probe(self, g, p.get("Coordinates"), scope)
+                if found is not None:
+                    maptex.record(env, param, tname, found, g)
+                    following = (env.entry.get("biome_follow") or {}).get(param)
+                    if following is not None:
+                        return maptex.follow(self, following, out)
+                    image = (env.entry.get("biome_maps") or {}).get(param)
+                    rect = maptex.rect_of(found, (env.entry.get("biome_rects") or {}).get(param))
+                    if image is not None and rect is not None:
+                        return maptex.sample(self, image, rect, out)
+            elif param and getattr(env, "entry", None) is not None and "landscape_layers" not in env.entry:
+                # off landscapes (grass blades): the terrain an instance is scattered on may paint this map
+                from . import maptex
+                found = maptex.probe(self, g, p.get("Coordinates"), scope)
+                if found is not None:
+                    maptex.record(env, param, tname, found, g)
+                    return maptex.instanced(self, param, found, self._plain_sample(p, tname, coords, out), out)
+            if array:
+                # map-wide arrays above read their first slice, as painted maps are
+                v = self.sample_array(tname, coords, p.get("SamplerType", ""))
+                return self.rgba_out(Val(v.s, 3), v.a, out)
+            return self._plain_sample(p, tname, coords, out)
         if t == "FunctionInput" and scope.get("_fn") is not None:
             return scope["_fn"].ue_input(x)
         if t == "FunctionInput":
@@ -847,6 +905,14 @@ class Translator(StaticsMixin, AttributesMixin, MathsMixin, GeometryMixin, Rende
                 return v
         self.warnings.append("unsupported %s (%s) -> 0" % (t, x["Name"]))
         return self.const(0.0)
+
+    def _plain_sample(self, p, tname, coords, out):
+        # its own sampler (the default source) filters and addresses as the texture says; a
+        # shared sampler (world group settings) wraps or clamps as its group does
+        src = str(p.get("SamplerSource", "")).split("::")[-1]
+        own = src in ("", "SSM_FromTextureAsset")
+        address = None if own else ("Clamp", "Clamp") if "Clamp" in src or "Terrain" in src else ("Wrap", "Wrap")
+        return self.sample(tname, coords, out, p.get("SamplerType", ""), own, address)
 
     # ------------------------------------------------------ compile time
     # Static bools never become nodes: UE picks the branch while compiling,

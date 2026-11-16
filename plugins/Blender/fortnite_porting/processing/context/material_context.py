@@ -8,6 +8,7 @@ from ..utils import *
 from ...utils import *
 from ...logger import Log
 from ...material_porter.material_choice import ExactChoice     # MP
+from ...material_porter.material_onto import onto_selected     # MP
 from .. import forge
 
 def create_texture_node(nodes, name, image, srgb):
@@ -76,44 +77,8 @@ def link_texture_node(nodes, links, node, target_node, mappings, x, y):
 material_hash_cache = {}
 material_name_cache = {}
 
-
-def is_datablock_alive(datablock):
-    # These caches persist for the whole Blender session and hold references to bpy datablocks
-    # (materials/images). If the user deletes a previously-imported model, undoes, or Blender
-    # orphan-purges, those datablocks are freed and the cached Python wrapper becomes a dangling
-    # "StructRNA of type X has been removed" — any attribute access raises ReferenceError. Probe
-    # safely so the cache can be pruned WITHOUT triggering the very crash we're avoiding.
-    if datablock is None:
-        return False
-    try:
-        _ = datablock.name
-        return True
-    except ReferenceError:
-        return False
-
-
-def get_live_cached(cache, key):
-    # Returns the cached datablock only if it's still alive; drops dead entries.
-    value = cache.get(key)
-    if value is None:
-        return None
-    if is_datablock_alive(value):
-        return value
-    cache.pop(key, None)
-    return None
-
-
 class MaterialImportContext:
-
-    def __init__(self):
-        for key, mat in list(material_hash_cache.items()):
-            if not is_datablock_alive(mat):
-                material_hash_cache.pop(key, None)
-
-        for key, mat in list(material_name_cache.items()):
-            if not is_datablock_alive(mat):
-                material_name_cache.pop(key, None)
-
+    
     def _apply_forge_if_enabled(self, material, meta):
         # Optional Forge V4 shader application (see processing/forge.py).
         # ensure_forge_data is only attempted once per import run - on failure
@@ -213,7 +178,7 @@ class MaterialImportContext:
         hash_key = hash_code(material_hash)
 
         mp = ExactChoice(self, material_data, material_slot, as_material_data)     # MP
-        if (existing_material := get_live_cached(material_hash_cache, hash_key)) and mp.reusable(existing_material):     # MP
+        if (existing_material := get_valid_cached_id(material_hash_cache, hash_key)) and mp.reusable(existing_material):     # MP
             if not as_material_data:
                 material_slot.material = existing_material
                 mp.reused(material_slot, existing_material, material_data)     # MP
@@ -223,7 +188,7 @@ class MaterialImportContext:
                 return
 
         # same name but different hash
-        if (name_existing := get_live_cached(material_name_cache, material_name.casefold())) and name_existing.get("Hash") != hash_key:
+        if (name_existing := get_valid_cached_id(material_name_cache, material_name.casefold())) and name_existing.get("Hash") != hash_key:
             material_name += f"_{hash_key}"
 
         if not as_material_data and material_slot.material.name.casefold() != material_name.casefold():
@@ -240,9 +205,10 @@ class MaterialImportContext:
         # isn't hidden then, its graph says how see-through it is
         use_exact = mp.use_exact(material)
         crunch_names = [n for n in vertex_crunch_names if n != "Transparent"] if use_exact else vertex_crunch_names
-        outline_shell = any(toon_outline_names, lambda x: x in material_name) and not any(toon_outline_disable_names, lambda x: x in material_name)
+        outline_shell = any(toon_outline_names, lambda x: x in material_name) and not any(toon_outline_disable_names, lambda x: x in material_name) and not material_data.get("MPOutline")     # MP: a part's overlay outline is built
         if (any(crunch_names, lambda x: x in material_name) 
                 or get_param(scalars, "HT_CrunchVerts") == 1 
+                or material_data.get("MPHidden")     # MP: a section the game doesn't draw
                 or outline_shell):
             self.full_vertex_crunch_materials.append(material)
             if outline_shell:     # MP: the game's outline shell is hidden, FP's outline draws one instead
@@ -381,7 +347,7 @@ class MaterialImportContext:
                     mappings = first(target_mappings.colors, lambda x: x.name.casefold() == name.casefold())
 
                 if mappings is None:
-                    is_vector = any(vector_param_names, lambda x: x.casefold() in name.casefold()) or any(list(value.values())[0:4], lambda v: v < 0)
+                    is_vector = any(vector_param_names, lambda x: x.casefold() in name.casefold()) or any([v for v in value.values() if isinstance(v, (int, float))][0:4], lambda v: v < 0)     # MP: the fork's colours carry Hex among sorted keys
 
                 if mappings is None:
                     return
@@ -536,7 +502,7 @@ class MaterialImportContext:
                 value = item.get("Value")
                 is_vector = (
                         any(vector_param_names, lambda x: x.casefold() in name.casefold())
-                        or any(list(value.values())[0:4], lambda v: v < 0)
+                        or any([v for v in value.values() if isinstance(v, (int, float))][0:4], lambda v: v < 0)     # MP: Hex among sorted keys
                 )
                 return create_vector_node(nodes, name, value) if is_vector else create_color_node(nodes, name, value)
 
@@ -623,6 +589,8 @@ class MaterialImportContext:
         materials = data.get("Materials")
 
         if not materials:
+            return
+        if onto_selected(self, materials):     # MP: onto the selected meshes, with the attributes the material reads
             return
 
         if is_object_import:

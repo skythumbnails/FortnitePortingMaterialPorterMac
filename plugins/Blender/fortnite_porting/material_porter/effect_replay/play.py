@@ -24,12 +24,14 @@ from .stand import (
     TURN_OWN,
     can_move,
     plain_world,
+    hold,
     holder_of,
     program,
     replay,
 )
 from .points import Track, bind_parameters, particle_lights, bindings, bound, points
 from .nodes import group, ribbons
+from .offset import APPLIED
 
 
 def _set(modifier, tree, name, value):
@@ -139,7 +141,7 @@ def _user(root, system):
                 value = True
             root[name] = value
     # UE's names are case-insensitive (a glider's bisFullyDeployed is the bIsFullyDeployed the game sets)
-    spelled = {n.lower(): n for n in list(system.user.offsets) + list(system.shared.offsets)}
+    spelled = {n.lower(): n for n in list(system.user.offsets) + list(system.shared.offsets) + list(getattr(system, "user_values", {}))}
     for name in [k for k in root.keys() if k.startswith(("User.", "NPC."))]:
         own = spelled.get(name.lower())
         if own is None:     # set by the export but not taken by this system
@@ -225,6 +227,7 @@ def play(root):
         yield "%s: nothing to replay it from" % root.name
         return
     exports, fields, table = stored
+    hold(root)          # it may have been put on another object by hand since
     scale = float(root.get(KEY_SCALE, 0.01))
     drawn_order = {}        # per piece (its layers: Fire, Fire001...): the players in creation order
     scene = bpy.context.scene
@@ -238,7 +241,10 @@ def play(root):
     # scene frame the effect starts on: the range's first, unless its Start Frame property says otherwise
     if KEY_START not in root:
         root[KEY_START] = scene.frame_start
-    start = int(root[KEY_START])
+    # its Offset (the side panel's) on top: the replay is made shifted
+    shifted = int(getattr(root, "fpmp_effect_offset", 0))
+    start = int(root[KEY_START]) + shifted
+    root[APPLIED] = shifted
     frames = max(1, scene.frame_end - start + 1)
     # loops, except one timed by an animation or played on a swing or an event
     if KEY_LOOP not in root:
@@ -411,7 +417,10 @@ def play(root):
         yield "%s: %s drawn see-through all along (their colour's alpha 0: waiting on something the game sets%s)" % (
             root.name, ", ".join(clear_ones[:6]), ": its %s at 0 - set on the effect's empty, then Replay Effect" % ", ".join(zero[:5]) if zero else "")
     approximate = [name for name in played if name in system.approximate and name not in system.gpu]
-    if approximate:
+    if approximate and getattr(system, "uncooked", False):
+        yield "%s: %s: not cooked (a project's own), played from their modules (approximated)%s" % (
+            root.name, ", ".join(approximate), "; modules not played: " + "; ".join(system.partial) if system.partial else "")
+    elif approximate:
         yield "%s: %s: stateless emitters, played from their settings (the engine's random draws apart)" % (root.name, ", ".join(approximate))
     gpu = [name for name in played if name in system.gpu]
     if gpu:

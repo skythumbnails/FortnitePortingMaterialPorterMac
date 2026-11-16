@@ -4,6 +4,7 @@
 
 <plugin parent> holds the plugin as package fpmp_baseline (see translator_test.py). Exit code 0 when every check passes."""
 import sys
+from types import SimpleNamespace
 
 import bpy
 from mathutils import Vector
@@ -121,19 +122,23 @@ groups = {c.name: c for c in v.data.collections}
 member = lambda n: next((g for g in rig_style.COLLECTIONS if g in groups and n in groups[g].bones), None)
 check("vehicle collections", [n for n in rig_style.COLLECTIONS if n in groups], list(rig_style.COLLECTIONS))
 for n, want in (("CR_Main", "Controls"), ("CR_Drive", "Controls"), ("CR_Steer", "Controls"), ("CR_Drift", "Controls"),
-                ("CR_Body", "Controls"), ("CR_Settings", "Controls"), ("CR_Wheel_wheel_disc_fr_l", "Controls"),
+                ("CR_Body", "Controls"), ("CR_Settings", "Mechanics"), ("CR_Wheel_wheel_disc_fr_l", "Controls"),
                 ("CR_Arch_wheel_disc_fr_l", "Secondary"), ("CR_Ground_wheel_disc_fr_l", "Mechanics"),
                 ("CR_Lift_wheel_disc_fr_l", "Mechanics"), ("CR_Suspension", "Mechanics"), ("CR_Lean", "Mechanics"),
                 ("CR_Body_Follow", "Mechanics"), ("wheel_disc_fr_l", "Game Bones"), ("frame", "Game Bones")):
     check("%s in %s" % (n, want), member(n), want)
 pose = v.pose.bones
-check("left wheel blue", tuple(pose["CR_Wheel_wheel_disc_fr_l"].color.custom.normal), rig_style.COLORS["L"], tol=0.01)
-check("right wheel red", tuple(pose["CR_Wheel_wheel_disc_fr_r"].color.custom.normal), rig_style.COLORS["R"], tol=0.01)
-check("main orange", tuple(pose["CR_Main"].color.custom.normal), rig_style.COLORS["main"], tol=0.01)
+from fpmp_baseline.processing.context import rig_kit  # noqa: E402
+check("left wheel Epic blue", tuple(pose["CR_Wheel_wheel_disc_fr_l"].color.custom.normal), rig_kit.COLORS["L"], tol=0.01)
+check("right wheel Epic red", tuple(pose["CR_Wheel_wheel_disc_fr_r"].color.custom.normal), rig_kit.COLORS["R"], tol=0.01)
+check("main Epic yellow", tuple(pose["CR_Main"].color.custom.normal), rig_kit.COLORS["root"], tol=0.01)
+check("drive, steer, drift each their colour", len({tuple(round(c, 2) for c in pose[n].color.custom.normal)
+      for n in ("CR_Main", "CR_Drive", "CR_Steer", "CR_Drift")}), 4)
+check("body a box", pose["CR_Body"].custom_shape.name, "OR_Box_Thick")
+check("drive Epic's arrow", pose["CR_Drive"].custom_shape.name, "OR_Arrow_Thick")
 check("main thick", pose["CR_Main"].custom_shape_wire_width, 3.5)
 check("arch thin", pose["CR_Arch_wheel_disc_fr_l"].custom_shape_wire_width, 1.5)
 check("wheel ring has a tick", pose["CR_Wheel_wheel_disc_fr_l"].custom_shape.name, "CR_CircleTick")
-check("settings gear", pose["CR_Settings"].custom_shape.name, "CR_Gear")
 check("settings defaults", tuple(pose["CR_Settings"][k] for k in ("auto_wheels", "auto_steer", "countersteer", "suspension", "lean")),
       (1.0, 1.0, 1.0, 1.0, 0.0))
 check("no settings left on the object", any(k in v for k in ("auto_wheels", "lean")), False)
@@ -261,7 +266,7 @@ def trike():
     vehicle_rig.create(obj)
     return obj
 tr = trike()
-check("centre wheel is a centre control", tuple(tr.pose.bones["CR_Wheel_wheel_disc_fr"].color.custom.normal), rig_style.COLORS["C"], tol=0.01)
+check("centre wheel is a centre control", tuple(tr.pose.bones["CR_Wheel_wheel_disc_fr"].color.custom.normal), rig_kit.COLORS["C"], tol=0.01)
 # 4. the body control is a primary width (spec table), drawn in the secondary tint
 check("body control width", pose["CR_Body"].custom_shape_wire_width, 2.5)
 # 5. a setting's reset value is its default
@@ -327,51 +332,259 @@ def quadruped(name, **options):
 q = quadruped("quad")
 qp = q.pose.bones
 qg = {c.name: c for c in q.data.collections}
+from fpmp_baseline.processing.context import rig_kit  # noqa: E402
 in_group = lambda n: next((g for g in rig_style.COLLECTIONS[:2] + (rig_style.FK,) + rig_style.COLLECTIONS[2:] if g in qg and n in qg[g].bones), None)
 check("creature collections", [c.name for c in q.data.collections if c.name in qg and c.name in
       rig_style.COLLECTIONS + (rig_style.FK,)], ["Controls", "Secondary", "FK", "Mechanics", "Game Bones"])
-check("creature visibility", [qg[n].is_visible for n in ("Controls", "Secondary", "FK", "Mechanics", "Game Bones")],
-      [True, True, False, False, False])
-for n, want in (("root", "Controls"), ("pelvis", "Controls"), ("spine_01", "Controls"), ("head", "Controls"),
-                ("tail_02", "Controls"), ("CR_IK_foot_l", "Controls"), ("CR_Pole_thigh_l", "Controls"),
-                ("CR_Eyes", "Controls"), ("CR_Settings", "Controls"), ("jaw", "Secondary"), ("toe_l", "Secondary"),
-                ("thigh_l", "FK"), ("calf_l", "FK"), ("foot_l", "FK"), ("CR_Eye_eye_l", "Mechanics")):
+for n, want in (("global_ctrl", "Controls"), ("root_ctrl", "Controls"), ("body_ctrl", "Controls"), ("pelvis_ctrl", "Controls"),
+                ("spine_01_ctrl", "Controls"), ("head_ctrl", "Controls"), ("tail_02_ctrl", "Controls"),
+                ("thigh_l_ik_ctrl", "Controls"), ("thigh_l_pv_ctrl", "Controls"), ("CR_Eyes", "Controls"),
+                ("CR_Eye_eye_l", "Controls"), ("jaw_ctrl", "Secondary"), ("toe_l_ctrl", "Secondary"),
+                ("thigh_l_ctrl", "FK"), ("calf_l_ctrl", "FK"), ("foot_l_ctrl", "FK"), ("CR_Settings", "Mechanics"),
+                ("MCH_thigh_l_ik", "Mechanics"), ("thigh_l", "Game Bones"), ("pelvis", "Game Bones")):
     check("%s in %s" % (n, want), in_group(n), want)
-check("root is main", tuple(qp["root"].color.custom.normal), rig_style.COLORS["main"], tol=0.01)
-check("root shape", qp["root"].custom_shape.name, "CR_CircleArrow")
-check("left foot IK blue", tuple(qp["CR_IK_foot_l"].color.custom.normal), rig_style.COLORS["L"], tol=0.01)
-check("right pole red", tuple(qp["CR_Pole_thigh_r"].color.custom.normal), rig_style.COLORS["R"], tol=0.01)
-check("pole is a diamond", qp["CR_Pole_thigh_r"].custom_shape.name, "CR_Diamond")
-check("spine centre yellow", tuple(qp["spine_01"].color.custom.normal), rig_style.COLORS["C"], tol=0.01)
-check("face thin", qp["jaw"].custom_shape_wire_width, 1.5)
+check("global yellow", tuple(qp["global_ctrl"].color.custom.normal), rig_kit.COLORS["root"], tol=0.01)
+check("global is Epic's hexagon", qp["global_ctrl"].custom_shape.name, "OR_Hexagon_Thin")
+check("body is Epic's octagon", qp["body_ctrl"].custom_shape.name, "OR_Octagon_Thin")
+check("foot IK is a box", qp["thigh_l_ik_ctrl"].custom_shape.name, "OR_Box_Thick")
+check("pole is a sphere", qp["thigh_r_pv_ctrl"].custom_shape.name, "OR_Sphere_Solid")
+check("left foot IK Epic blue", tuple(qp["thigh_l_ik_ctrl"].color.custom.normal), rig_kit.COLORS["L"], tol=0.01)
+check("right pole Epic red", tuple(qp["thigh_r_pv_ctrl"].color.custom.normal), rig_kit.COLORS["R"], tol=0.01)
+check("spine square", qp["spine_01_ctrl"].custom_shape.name, "OR_RoundedSquare_Thick")
+check("toe an arrow", qp["toe_l_ctrl"].custom_shape.name, "OR_Arrow_Thick")
+check("face thin", qp["jaw_ctrl"].custom_shape_wire_width, 1.5)
+check("pole line unselectable", q.data.bones["MCH_thigh_l_pole_line"].hide_select, True)
 check("creature settings", sorted(k for k in qp["CR_Settings"].keys() if not k.startswith("_")),
       ["eyes_aim", "ik_fthigh_l", "ik_fthigh_r", "ik_thigh_l", "ik_thigh_r"])
-check("no settings left on the object", any(k.startswith("ik_") or k == "eyes_aim" for k in q.keys()), False)
 check("creature drawn in front", q.show_in_front, True)
-# IK at 0 lets the foot go: moving the IK target no longer moves the foot
+check("FK rings hidden while IK", (qp["thigh_l_ctrl"].hide, qp["thigh_l_ik_ctrl"].hide), (True, False))
+
+
+def world(obj, bone):
+    return obj.matrix_world @ obj.pose.bones[bone].matrix
+
+
+def game_bones(obj):
+    return [b for b in obj.data.bones if not b.name.endswith("_ctrl") and not b.name.startswith(("MCH_", "CR_"))]
+
+
+def rest_kept(obj):
+    """Worst distance of a game bone from its rest (the rig must change nothing at rest)."""
+    bpy.context.view_layer.update()
+    return max(((obj.pose.bones[b.name].matrix.to_translation() - b.matrix_local.to_translation()).length
+                for b in game_bones(obj)), default=0.0)
+
+
+def turned(obj):
+    worst = 0.0
+    for b in game_bones(obj):
+        diff = obj.pose.bones[b.name].matrix.to_quaternion().rotation_difference(b.matrix_local.to_quaternion()).angle
+        worst = max(worst, min(diff, 6.2831853 - diff))
+    return worst
+
+
+check("rest kept: no bone moved", rest_kept(q) < 1e-4, True)
+check("rest kept: no bone turned", turned(q) < 1e-3, True)
+# IK moves the foot; IK 0 lets it go
+rest = world(q, "foot_l").to_translation()
+qp["thigh_l_ik_ctrl"].location = (0.0, 0.0, 0.1)
 bpy.context.view_layer.update()
-rest = (q.matrix_world @ qp["foot_l"].head).copy()
-qp["CR_IK_foot_l"].location = (0.0, 0.0, 0.1)
-bpy.context.view_layer.update()
-followed = ((q.matrix_world @ qp["foot_l"].head) - rest).length
+followed = (world(q, "foot_l").to_translation() - rest).length
 qp["CR_Settings"]["ik_thigh_l"] = 0.0
 q.update_tag()
 bpy.context.view_layer.update()
-left_alone = ((q.matrix_world @ qp["foot_l"].head) - rest).length
+left_alone = (world(q, "foot_l").to_translation() - rest).length
 check("IK moves the foot", followed > 0.02, True)
 check("IK 0 lets it go", left_alone < 1e-3, True)
-qp["CR_IK_foot_l"].location = (0.0, 0.0, 0.0)
+qp["thigh_l_ik_ctrl"].location = (0.0, 0.0, 0.0)
 qp["CR_Settings"]["ik_thigh_l"] = 1.0
+q.update_tag()
+# switching keeps the pose: FK bent, to IK; IK moved, to FK
+rig_kit.switch(q, "thigh_l", ik=False, match=True)
+qp["thigh_l_ctrl"].rotation_mode = 'XYZ'
+qp["thigh_l_ctrl"].rotation_euler = (0.4, 0.1, 0.2)
+qp["calf_l_ctrl"].rotation_mode = 'XYZ'
+qp["calf_l_ctrl"].rotation_euler = (-0.5, 0.0, 0.0)
+bpy.context.view_layer.update()
+fk_foot, fk_calf = world(q, "foot_l").copy(), world(q, "calf_l").copy()
+rig_kit.switch(q, "thigh_l", ik=True, match=True)
+check("FK to IK keeps the foot", (world(q, "foot_l").to_translation() - fk_foot.to_translation()).length < 2e-3, True)
+check("FK to IK keeps the foot's turn", world(q, "foot_l").to_quaternion().rotation_difference(fk_foot.to_quaternion()).angle < 2e-2, True)
+check("FK to IK keeps the knee", (world(q, "calf_l").to_translation() - fk_calf.to_translation()).length < 5e-3, True)
+qp["thigh_l_ik_ctrl"].location = qp["thigh_l_ik_ctrl"].location + Vector((0.03, 0.0, 0.05))
+bpy.context.view_layer.update()
+ik_foot, ik_calf = world(q, "foot_l").copy(), world(q, "calf_l").copy()
+rig_kit.switch(q, "thigh_l", ik=False, match=True)
+check("IK to FK keeps the foot", (world(q, "foot_l").to_translation() - ik_foot.to_translation()).length < 1e-4, True)
+check("IK to FK keeps the calf", (world(q, "calf_l").to_translation() - ik_calf.to_translation()).length < 1e-4, True)
+check("FK shown, IK hidden", (qp["thigh_l_ctrl"].hide, qp["thigh_l_ik_ctrl"].hide), (False, True))
+# the rig off: the game bones play their own keys; Bake to Controls brings an animation onto the controls
+qa = quadruped("quad_anim")
+qa.animation_data_create()
+qa.animation_data.action = bpy.data.actions.new("quad_anim keys")
+for f, k in ((1, 0.0), (5, 1.0)):
+    for n, r in (("spine_01", (0.2, 0.0, 0.1)), ("thigh_l", (0.4, 0.0, 0.0)), ("calf_l", (-0.6, 0.0, 0.0)), ("tail_02", (0.0, 0.3, 0.0)),
+                 ("jaw", (0.3, 0.0, 0.0))):
+        pb = qa.pose.bones[n]
+        pb.rotation_mode = 'XYZ'
+        pb.rotation_euler = tuple(v * k for v in r)
+        pb.keyframe_insert("rotation_euler", frame=f)
+rig_kit.on_animation_import(qa)
+bpy.context.scene.frame_set(5)
+played = {n: world(qa, n).copy() for n in ("spine_02", "foot_l", "tail_03", "jaw", "head")}
+check("rig off: the animation plays", (played["foot_l"].to_translation() - (qa.matrix_world @ qa.data.bones["foot_l"].head_local)).length > 0.02, True)
+rig_kit.bake_to_controls(qa, 1, 5)
+bpy.context.scene.frame_set(5)
+check("bake: rig on", bool(qa.data[rig_kit.ON]), True)
+check("bake: every bone lands", max((world(qa, n).to_translation() - m.to_translation()).length for n, m in played.items()) < 1e-4, True)
+check("bake: and turns as played", max(world(qa, n).to_quaternion().rotation_difference(m.to_quaternion()).angle
+                                        for n, m in played.items()) < 1e-3, True)
+check("bake: bones' keys kept in a track", [t.name for t in qa.animation_data.nla_tracks], ["RK bones"])
+# the panel's operators: one click switches several limbs, keeping the pose
+from fpmp_baseline.operator import rig_ui  # noqa: E402
+from fpmp_baseline.processing.context import kit_panel  # noqa: E402
+try:
+    rig_ui.register()
+except ValueError:
+    pass                # registered earlier in this run
+bpy.context.view_layer.objects.active = q
+bpy.ops.fpmp.kit_switch(limbs="thigh_l,thigh_r", ik=True)
+check("panel: one click switches both", (qp["CR_Settings"]["ik_thigh_l"], qp["CR_Settings"]["ik_thigh_r"]), (1.0, 1.0))
+check("panel rows: all, front, hind, then each limb", [label for label, _ in kit_panel.groups(q)][:4], ["All", "Front Legs", "Hind Legs", "Front Leg L"])
+bpy.ops.fpmp.kit_rig_on(on=False)
+check("panel: rig off mutes the kit's constraints", all(c.mute for pb in qp for c in pb.constraints if c.name.startswith("RK ")), True)
+bpy.ops.fpmp.kit_rig_on(on=True)
 q2 = quadruped("quad_no_eyes", eyes=False)
 check("no eyes: no eyes_aim", "eyes_aim" in q2.pose.bones["CR_Settings"], False)
-
 q3 = quadruped("quad_tail_on_root", tail_on_root=True)
-check("root keeps its shape when a limb hangs off it", q3.pose.bones["root"].custom_shape.name, "CR_CircleArrow")
-check("root keeps its width when a limb hangs off it", q3.pose.bones["root"].custom_shape_wire_width, 3.5)
-
-# review fixes
+check("tail on the root: under the body", q3.pose.bones["tail_01_ctrl"].parent.name, "body_ctrl")
+check("tail on the root: rest kept", rest_kept(q3) < 1e-4, True)
 q4 = quadruped("quad_scapula", scapula=True)
-check("shoulder blade is secondary", next((g for g in ("Controls", "Secondary") if "scapula_l" in q4.data.collections[g].bones), None), "Secondary")
+check("shoulder blade a control", next((g for g in ("Controls", "Secondary") if "scapula_l_ctrl" in q4.data.collections[g].bones), None), "Controls")
+check("scapula: rest kept", rest_kept(q4) < 1e-4, True)
+
+
+def paws(name, goals=True):
+    """Fortnite's quadruped layout (wolf, sidekick dog): legs of thigh, knee, ankle (the long metatarsal), ball, toe;
+    the game's own IK goals (IK_Foot_Rear_L) on the balls; a scapula beside the front shoulder; a stub spine bone whose
+    tail points sideways (EggBawk's spine_03)."""
+    data = bpy.data.armatures.new(name)
+    obj = bpy.data.objects.new(name, data)
+    bpy.context.scene.collection.objects.link(obj)
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode='EDIT')
+    edit = data.edit_bones
+
+    def bone(n, head, tail, parent=None):
+        b = edit.new(n)
+        b.head, b.tail, b.parent = head, tail, parent
+        return b
+    root = bone("root", (0, 0, 0), (0, 0.1, 0))
+    pelvis = bone("pelvis", (0, 0.4, 0.6), (0, 0.2, 0.6), root)
+    spine1 = bone("spine_01", (0, 0.2, 0.6), (0, 0.0, 0.62), pelvis)
+    spine2 = bone("spine_02", (0, 0.0, 0.62), (0.01, 0.0, 0.62), spine1)        # a stub, pointing sideways
+    neck = bone("neck", (0, -0.3, 0.65), (0, -0.45, 0.8), spine2)
+    head = bone("head", (0, -0.45, 0.8), (0, -0.6, 0.85), neck)
+    ear = bone("ear_01_l", (-0.05, -0.5, 0.88), (-0.06, -0.5, 0.95), head)
+    bone("ear_02_l", (-0.06, -0.5, 0.95), (-0.07, -0.5, 1.0), ear)
+    bone("lip_corner_l", (-0.03, -0.62, 0.78), (-0.03, -0.64, 0.78), head)
+    goal_root = bone("IK_Foot_Root", (0, 0, 0), (0, 0.1, 0), root)
+    for side, x in (("l", -0.12), ("r", 0.12)):
+        for prefix, y, parent in (("bk", 0.35, pelvis), ("fr", -0.2, spine2)):
+            top = bone("thigh_%s_%s" % (prefix, side), (x, y, 0.55), (x, y - 0.08, 0.35), parent)
+            if prefix == "fr":
+                bone("scapula_%s_%s" % (prefix, side), (x, y, 0.55), (x, y + 0.05, 0.65), top)
+            knee = bone("knee_%s_%s" % (prefix, side), (x, y - 0.08, 0.35), (x, y + 0.02, 0.2), top)
+            ankle = bone("ankle_%s_%s" % (prefix, side), (x, y + 0.02, 0.2), (x, y - 0.02, 0.05), knee)
+            ball = bone("ball_%s_%s" % (prefix, side), (x, y - 0.02, 0.05), (x, y - 0.08, 0.02), ankle)
+            bone("toe_%s_%s" % (prefix, side), (x, y - 0.08, 0.02), (x, y - 0.13, 0.0), ball)
+            if goals:
+                bone("IK_Foot_%s_%s" % ("Rear" if prefix == "bk" else "Front", side.upper()), ball.head.copy(),
+                     ball.head + Vector((0, 0, 0.05)), goal_root)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    creature_rig.create(obj)
+    return obj
+
+
+w = paws("paws")
+wp, wl = w.pose.bones, {l["name"]: l for l in rig_kit.meta(w)["limbs"]}
+hind = wl["thigh_bk_l"]
+check("game IK goal: the leg ends at the ball", [hind["foot"], hind["heel"], len(hind["mch"])], ["ball_bk_l", "ankle_bk_l", 2])
+check("game IK goal: front too", wl["thigh_fr_l"]["foot"], "ball_fr_l")
+check("no goals: a ball bone ends it", rig_kit.meta(paws("paws_no_goals", goals=False))["limbs"][0]["foot"].startswith("ball_"), True)
+check("paws: rest kept", (rest_kept(w) < 1e-4, turned(w) < 1e-3), (True, True))
+# the paw control carries the hock: the knee chain ends on it, the ball lands on the target
+wp["thigh_bk_l_ik_ctrl"].location = (0.0, -0.05, 0.12)
+bpy.context.view_layer.update()
+hock_gap = (wp["MCH_knee_bk_l_ik"].tail - wp["ankle_bk_l"].head).length
+check("digitigrade: the hock stays on the knee", hock_gap < 1e-4, True)
+check("digitigrade: the ball lands on the paw control", (wp["ball_bk_l"].head - wp["thigh_bk_l_ik_ctrl"].head).length < 1e-4, True)
+toe_off = (wp["ball_bk_l"].matrix.inverted() @ wp["toe_bk_l"].matrix).translation -     (w.data.bones["ball_bk_l"].matrix_local.inverted() @ w.data.bones["toe_bk_l"].matrix_local).translation
+check("toes follow the IK paw", toe_off.length < 1e-4, True)
+# pulled past reach the leg stays whole
+wp["thigh_bk_l_ik_ctrl"].location = (0.0, 0.0, -0.5)
+bpy.context.view_layer.update()
+check("over-pulled: the leg stays whole", (wp["MCH_knee_bk_l_ik"].tail - wp["ankle_bk_l"].head).length < 1e-4, True)
+wp["thigh_bk_l_ik_ctrl"].location = (0.0, 0.0, 0.0)
+# a planted front leg while the body drops: the scapula stays on its shoulder
+wp["body_ctrl"].location = (0.0, 0.0, -0.05)
+bpy.context.view_layer.update()
+blade = (wp["thigh_fr_l"].matrix.inverted() @ wp["scapula_fr_l"].matrix).translation -     (w.data.bones["thigh_fr_l"].matrix_local.inverted() @ w.data.bones["scapula_fr_l"].matrix_local).translation
+check("a bone beside an IK limb stays on it", blade.length < 1e-4, True)
+check("planted paw stays put", (wp["ball_fr_l"].head - w.data.bones["ball_fr_l"].head_local).length < 1e-4, True)
+wp["body_ctrl"].location = (0.0, 0.0, 0.0)
+bpy.context.view_layer.update()
+# a stub spine bone's square stands across the spine, not along its sideways tail
+pb = wp["spine_02_ctrl"]
+normal = w.data.bones["spine_02_ctrl"].matrix_local.to_3x3() @ pb.custom_shape_rotation_euler.to_matrix() @ Vector((0, 0, 1))
+along = (w.data.bones["neck"].head_local - w.data.bones["spine_02"].head_local).normalized()
+check("face: ear chain rings, lip a ball", [wp["ear_01_l_ctrl"].custom_shape.name, wp["ear_02_l_ctrl"].custom_shape.name,
+      wp["lip_corner_l_ctrl"].custom_shape.name], ["OR_Circle_Thick", "OR_Circle_Thick", "OR_Sphere_Thick"])
+check("face: the jaw a box", qp["jaw_ctrl"].custom_shape.name, "OR_Box_Thick")
+check("stub spine bone: square across the spine", abs(normal.normalized().dot(along)) > 0.99, True)
+
+def cow(name):
+    """The LEGO cow's layout: the head off the body's branch, the pelvis and chest beside it; legs of two bones."""
+    data = bpy.data.armatures.new(name)
+    obj = bpy.data.objects.new(name, data)
+    bpy.context.scene.collection.objects.link(obj)
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode='EDIT')
+    edit = data.edit_bones
+
+    def bone(n, head, tail, parent=None):
+        b = edit.new(n)
+        b.head, b.tail, b.parent = head, tail, parent
+        return b
+    root = bone("root", (0, 0, 0), (0, 0, 0.6))
+    body = bone("body", (0, 0, 0.67), (0, 0, 0.46), root)
+    upper = bone("upper_body", (0, 0, 0.51), (0, 0.1, 0.75), body)
+    neck = bone("neck", (0, -0.32, 0.51), (0, -0.4, 0.75), upper)
+    bone("head", (0, -0.46, 0.75), (0, -0.6, 0.75), neck)
+    bone("tail1", (0, 0.44, 0.75), (0, 0.52, 0.75), upper)
+    chest = bone("chest", (0, -0.08, 0.45), (0, -0.3, 0.45), body)
+    pelvis = bone("pelvis", (0, 0.08, 0.45), (0, 0.09, 0.45), body)
+    for side, x in (("l", 0.16), ("r", -0.16)):
+        for leg, y, parent in (("legA", -0.32, chest), ("legB", 0.32, pelvis)):
+            upper_leg = bone("%s_01_%s" % (leg, side), (x, y, 0.43), (x, y, 0.19), parent)
+            bone("%s_02_%s" % (leg, side), (x, y, 0.19), (x, y, 0.0), upper_leg)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    creature_rig.create(obj)
+    return obj
+
+
+qc2 = cow("cow")
+check("cow: spine found through the head", [n for n in ("body", "upper_body", "neck", "head") if n + "_ctrl" in qc2.pose.bones],
+      ["body", "upper_body", "neck", "head"])
+check("cow: two-bone legs get IK", sorted(k for k in qc2.pose.bones["CR_Settings"].keys() if k.startswith("ik_")),
+      ["ik_legA_01_l", "ik_legA_01_r", "ik_legB_01_l", "ik_legB_01_r"])
+check("cow: rest kept", rest_kept(qc2) < 1e-4, True)
+check("cow: rest kept, no turn", turned(qc2) < 1e-3, True)
+qc2.pose.bones["legB_01_l_ik_ctrl"].location = (0.0, 0.05, 0.08)
+bpy.context.view_layer.update()
+tip = qc2.matrix_world @ qc2.pose.bones["legB_02_l"].tail
+target = qc2.matrix_world @ qc2.pose.bones["legB_01_l_ik_ctrl"].head
+check("cow: the hoof reaches its IK", (tip - target).length < 2e-3, True)
 
 
 def snake(name):
@@ -394,9 +607,9 @@ def snake(name):
 
 s = snake("snake")
 check("flat skeleton rigs", bool(s.data.get(creature_rig.KEY)), True)
-check("flat skeleton has its gear", "CR_Settings" in s.pose.bones, True)
+check("flat skeleton has its settings", "CR_Settings" in s.pose.bones, True)
 check("no IK: no FK group", "FK" in s.data.collections, False)
-check("flat skeleton controls are visible", s.pose.bones["root"].custom_shape_scale_xyz[0] > 0.05, True)
+check("flat skeleton controls are visible", s.pose.bones["global_ctrl"].custom_shape_scale_xyz[0] * 0.05 > 0.05, True)
 
 # the LEGO figure on the kit: the shared minifigure skeleton, facing -Y (its right is -X)
 from fpmp_baseline.processing.context import lego_rig  # noqa: E402
@@ -464,19 +677,31 @@ fp = fig.pose.bones
 fgroups = {c.name: c for c in fig.data.collections}
 member_of = lambda n: next((g for g in rig_style.COLLECTIONS if g in fgroups and n in fgroups[g].bones), None)
 check("lego collections", [c.name for c in fig.data.collections if c.name in rig_style.COLLECTIONS], list(rig_style.COLLECTIONS))
-for n, want in (("root", "Controls"), ("pelvis", "Controls"), ("torso", "Controls"), ("head", "Controls"),
-                ("leg_l", "Controls"), ("arm_r", "Controls"), ("hand_l", "Controls"), ("head_accessory", "Secondary"),
-                ("neck_accessory", "Game Bones")):
+for n, want in (("global_ctrl", "Controls"), ("root_ctrl", "Controls"), ("pelvis_ctrl", "Controls"), ("torso_ctrl", "Controls"),
+                ("head_ctrl", "Controls"), ("leg_l_ctrl", "Controls"), ("arm_r_ctrl", "Controls"), ("hand_l_ctrl", "Controls"),
+                ("head_accessory_ctrl", "Secondary"), ("neck_accessory", "Game Bones"), ("leg_l", "Game Bones")):
     check("lego %s in %s" % (n, want), member_of(n), want)
-check("lego root main", tuple(fp["root"].color.custom.normal), rig_style.COLORS["main"], tol=0.01)
-check("lego left leg blue", tuple(fp["leg_l"].color.custom.normal), rig_style.COLORS["L"], tol=0.01)
-check("lego right arm red", tuple(fp["arm_r"].color.custom.normal), rig_style.COLORS["R"], tol=0.01)
-check("lego leg dial ticks", fp["leg_l"].custom_shape.name, "CR_CircleTick")
-check("lego torso ring", fp["torso"].custom_shape.name, "CR_Circle")
-check("lego accessory box", fp["head_accessory"].custom_shape.name, "CR_Box")
-check("lego accessory thin", fp["head_accessory"].custom_shape_wire_width, 1.5)
-check("lego leg swings on one axis", tuple(fp["leg_l"].lock_rotation), (False, True, True))
+check("lego global yellow", tuple(fp["global_ctrl"].color.custom.normal), rig_kit.COLORS["root"], tol=0.01)
+check("lego body octagon", fp["pelvis_ctrl"].custom_shape.name, "OR_Octagon_Thin")
+check("lego left leg Epic blue", tuple(fp["leg_l_ctrl"].color.custom.normal), rig_kit.COLORS["L"], tol=0.01)
+check("lego right arm Epic red", tuple(fp["arm_r_ctrl"].color.custom.normal), rig_kit.COLORS["R"], tol=0.01)
+check("lego leg dial", fp["leg_l_ctrl"].custom_shape.name, "OR_Circle_Thick")
+check("lego torso square", fp["torso_ctrl"].custom_shape.name, "OR_RoundedSquare_Thick")
+check("lego accessory box", fp["head_accessory_ctrl"].custom_shape.name, "OR_Box_Thick")
+check("lego accessory thin", fp["head_accessory_ctrl"].custom_shape_wire_width, 1.5)
+check("lego leg swings on one axis", tuple(fp["leg_l_ctrl"].lock_rotation), (False, True, True))
 check("lego drawn in front", fig.show_in_front, True)
+check("lego rest kept", rest_kept(fig) < 1e-4, True)
+check("lego rest kept, no turn", turned(fig) < 1e-3, True)
+# the dials sit outside their limbs, one on each side: they don't overlap
+dial = lambda n: fig.matrix_world @ (fig.pose.bones[n].matrix @ Vector(fig.pose.bones[n].custom_shape_translation))
+check("lego leg dials apart", (dial("leg_l_ctrl") - dial("leg_r_ctrl")).length > 0.25, True)
+check("lego head ring above the shoulders", dial("head_ctrl").z > fig.data.bones["arm_l"].head_local.z, True)
+fp["leg_l_ctrl"].rotation_euler = (0.5, 0.0, 0.0)
+bpy.context.view_layer.update()
+check("lego leg follows its control", fig.pose.bones["leg_l"].matrix.to_quaternion().rotation_difference(
+      fig.data.bones["leg_l"].matrix_local.to_quaternion()).angle > 0.4, True)
+fp["leg_l_ctrl"].rotation_euler = (0.0, 0.0, 0.0)
 check("no face material, no board", "CR_FaceBoard" in fp, False)
 
 # the face board
@@ -663,6 +888,16 @@ qc = quadruped_bones("quad_face_first")
 attach_face(qc, "quad_face_first", FLIP)
 creature_rig.create(qc)
 check("creature rig adds the board", "CR_FaceBoard" in qc.data.bones, True)
+# the app's face board button on an armature without a board
+from fpmp_baseline.material_porter import mesh_hooks  # noqa: E402
+qbtn = quadruped_bones("quad_face_button")
+attach_face(qbtn, "quad_face_button", FLIP)
+for o in bpy.context.view_layer.objects:
+    o.select_set(False)
+bpy.context.view_layer.objects.active = qbtn
+qbtn.select_set(True)
+check("face board button: handled", mesh_hooks.apply_rig(SimpleNamespace(options={"RigType": 1}), {"Apply": "FaceBoard"}), True)
+check("face board button: the board built", "CR_FaceBoard" in qbtn.data.bones, True)
 # Tasty: the hook's restyle + board, via tasty_style
 tf = ta.copy(); tf.data = ta.data.copy(); bpy.context.scene.collection.objects.link(tf)
 tf.data[tasty_style.MARK] = False
@@ -769,6 +1004,36 @@ check("toon mouth steps through every cell of the sheet", round(toon_values(9)["
 check("toon mouth stops at the sheet's last cell", round(toon_values(40)["Default Face"]), 15)
 check("toon blink and angry brows", on(toon_values(0, 1, 3)), ["C_glabella_down_pose", "R_blink_pose"])
 check("toon eyes and brows stop at their last state", on(toon_values(0, 9, 9)), ["C_glabella_down_pose", "R_squint_inner_pose"])
+
+# a flipbook mouth with eye and brow pieces its own curves swap (WartyBark's): its states come from those curves
+BARK = {"flipbook_face_mouth_index": 0.0, "R_blink_pose": 0.0, "R_wide_pose": 0.0, "R_lower_lid_up_pose": 0.0,
+        "R_brow_down_pose": 0.0, "R_brow_squeeze_in_pose": 0.0, "Threshold_Blink": 0.5}
+bf = bpy.data.objects.new("barkfig", bpy.data.armatures.new("barkfig"))
+bpy.context.scene.collection.objects.link(bf)
+bpy.context.view_layer.objects.active = bf
+bpy.ops.object.mode_set(mode='EDIT')
+hb = bf.data.edit_bones.new("head")
+hb.head, hb.tail = (0, 0, 1.0), (0, 0, 1.2)
+bpy.ops.object.mode_set(mode='OBJECT')
+bmat, bnode = attach_face(bf, "barkfig", BARK)
+check("bark board added", face_board.add(bf, head="head"), True)
+check("bark states", dict(bf["fpmp_face_board_states"]), {"CR_Face_Eyes": ["Open", "Blink", "Wide", "Lower Lid Up"],
+                                                          "CR_Face_Brows": ["None", "Down", "Squeeze In"]})
+bf.pose.bones["CR_Face_Eyes"].location.x = 2 * face_board.step_of(bf)
+bf.update_tag()
+bpy.context.view_layer.update()
+check("bark wide eyes", [round(bnode.inputs[k].default_value) for k in ("R_blink_pose", "R_wide_pose")], [0, 1])
+# only eye and brow curves: a board all the same
+CURVED = {"R_blink_pose": 0.0, "R_brow_up_pose": 0.0}
+cf = bpy.data.objects.new("curvefig", bpy.data.armatures.new("curvefig"))
+bpy.context.scene.collection.objects.link(cf)
+bpy.context.view_layer.objects.active = cf
+bpy.ops.object.mode_set(mode='EDIT')
+hb = cf.data.edit_bones.new("head")
+hb.head, hb.tail = (0, 0, 1.0), (0, 0, 1.2)
+bpy.ops.object.mode_set(mode='OBJECT')
+attach_face(cf, "curvefig", CURVED)
+check("curves only: a board", face_board.add(cf, head="head"), True)
 
 # a flipbook face whose pupils follow the look curves (Peabody's): a Look pad, the mouth sheet's own size
 PEAS = {"flipbook_face_mouth_index": 0.0, "Mouth_SubimagesX": 4.0, "Mouth_SubimagesY": 2.0,

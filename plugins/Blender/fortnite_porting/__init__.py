@@ -23,7 +23,7 @@ bl_info = {
     "description": "Import Server for Fortnite Porting",
     "author": "Half",
     "blender": (4, 2, 0),
-    "version": (4, 0, 0),
+    "version": (4, 3, 6),
     "category": "Import-Export",
 }
 
@@ -45,7 +45,10 @@ def server_data_handler():
             Log.error(f"An unhandled error occurred:")
             traceback.print_exc()
 
-            display_popup(error_message, "An unhandled error occurred", "ERROR")
+            try:     # MP: Blender drops a timer that raises, and every later export would queue unimported
+                display_popup(error_message, "An unhandled error occurred", "ERROR")
+            except Exception:
+                traceback.print_exc()
 
     return 0.01
 
@@ -77,9 +80,14 @@ def register():
     convert_op.register()
     # MP: the FP Material Fixer (unlinked textures, UEFN islands' missing ones)
     material_fixer.register()
+    # MP: terrain provider API for add-ons that generate terrain (bpy.app.driver_namespace["fp_terrain_api"])
+    from .material_porter import terrain_provider
+    terrain_provider.register()
 
 
 def unregister():
+    from .material_porter import terrain_provider
+    terrain_provider.unregister()
     server.shutdown()
 
     bpy.app.handlers.load_post.remove(scene_load_handler)

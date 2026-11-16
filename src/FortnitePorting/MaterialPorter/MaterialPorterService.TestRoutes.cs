@@ -56,7 +56,7 @@ public partial class MaterialPorterService
 
 
     // Renders the window as shown to a PNG (on the UI thread).
-    private static Avalonia.PixelSize SaveShot(Avalonia.Controls.Window window, string file)
+    internal static Avalonia.PixelSize SaveShot(Avalonia.Controls.Window window, string file)
     {
         var size = new Avalonia.PixelSize((int) window.Bounds.Width, (int) window.Bounds.Height);
         using var shot = new Avalonia.Media.Imaging.RenderTargetBitmap(size);
@@ -65,8 +65,27 @@ public partial class MaterialPorterService
         return size;
     }
 
+    /// <summary>The owner's own test routes (fpfork-private): an answer, or null for the fork's.</summary>
+    public static Func<string, NameValueCollection, Task<object?>>? OwnerRoutes;
+
     private async Task<object?> TestRouteAsync(string route, NameValueCollection query)
     {
+        if (OwnerRoutes != null && await OwnerRoutes(route, query) is { } owned) return owned;
+        if (route == "fork-restart")
+        {
+            Avalonia.Threading.Dispatcher.UIThread.Post(() => AppServices.App.Restart());
+            return new { restarting = true };
+        }
+        if (route == "fork-uefn-access")
+        {
+            if (query["save"] is { } save) UefnAccess.SaveForTest(save);
+            if (query["clear"] == "1") UefnAccess.SignOut();
+            return new
+            {
+                granted = UefnAccess.Granted, user = UefnAccess.User, unreachable = UefnAccess.Unreachable,
+                withRole = UefnAccess.HasRole(JObject.Parse("{\"roles\":[\"" + (query["role"] ?? "") + "\"]}")),
+            };
+        }
         if (route == "fork-projects")
         {
             // UEFN projects found, which island is which, and what graphs came from where so far
@@ -115,8 +134,12 @@ public partial class MaterialPorterService
         if (route == "fork-screenshot")
         {
             // The window showing an asset tab (type=; search=, filters=Title,Title, select=<display name> opens its info),
-            // rendered to a PNG (path=) after wait= seconds (icons load).
+            // rendered to a PNG (path=) after wait= seconds (icons load); rig=<ERigType> for this shot only.
             var window = AppServices.App.Lifetime.MainWindow!;
+            var rigWas = AppSettings.ExportSettings.Blender.RigType;
+            if (query["rig"] is { } shotRig)
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                    AppSettings.ExportSettings.Blender.RigType = Enum.Parse<ViewModels.Settings.ERigType>(shotRig, true));
             await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
             {
                 window.WindowState = Avalonia.Controls.WindowState.Normal;
@@ -154,6 +177,7 @@ public partial class MaterialPorterService
             {
                 var file = query["path"] ?? throw new ArgumentException("path missing");
                 var size = SaveShot(window, file);
+                AppSettings.ExportSettings.Blender.RigType = rigWas;
                 return new { file, size.Width, size.Height, AppServices.AssetLoading.ActiveLoader?.Filtered.Count };
             });
         }
@@ -169,7 +193,7 @@ public partial class MaterialPorterService
                 window.WindowState = Avalonia.Controls.WindowState.Normal;
                 window.Width = 1600;
                 window.Height = int.TryParse(query["height"], out var tall) ? tall : 1100;
-                AppServices.Navigation.App.Open<Views.SettingsView>();
+                AppServices.AppWM.OpenSettings();
             });
             // the settings pane's own frame exists once its view has loaded
             await Task.Delay(TimeSpan.FromSeconds(1));
@@ -215,7 +239,7 @@ public partial class MaterialPorterService
                 window.Width = 1600;
                 window.Height = 1100;
                 foreach (var folder in shown) settings.UefnProjectFolders.Add(folder);
-                AppServices.Navigation.App.Open<Views.SettingsView>();
+                AppServices.AppWM.OpenSettings();
                 AppServices.Navigation.Settings.Open<Views.Settings.ApplicationSettingsView>();
             });
             await Task.Delay(TimeSpan.FromSeconds(3));
@@ -229,10 +253,15 @@ public partial class MaterialPorterService
         }
         if (route == "fork-settings-shot")
         {
-            // The Blender export settings page showing a section (section= its sidebar button's text), rendered to a PNG (path=).
+            // The Blender export settings page showing a section (section= its sidebar button's text), rendered to a PNG (path=);
+            // rig=<ERigType> shows that rig's settings (put back after).
             var window = AppServices.App.Lifetime.MainWindow!;
+            var blenderSettings = AppSettings.ExportSettings.Blender;
+            var rigWas = blenderSettings.RigType;
             await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
             {
+                if (query["rig"] is { } rig)
+                    blenderSettings.RigType = Enum.Parse<ViewModels.Settings.ERigType>(rig, true);
                 window.WindowState = Avalonia.Controls.WindowState.Normal;
                 window.Width = 1600;
                 window.Height = 1100;
@@ -253,7 +282,9 @@ public partial class MaterialPorterService
                 var file = query["path"] ?? throw new ArgumentException("path missing");
                 var size = SaveShot(window, file);
                 var blender = AppSettings.ExportSettings.Blender;
-                return new { file, blender.SubsurfaceIntensity, blender.BaseSubsurface, blender.SubsurfaceScale, blender.ProfileColour, blender.FurSubsurfaceIntensity, blender.FurSubsurfaceScale };
+                var shownRig = blender.RigType;
+                blender.RigType = rigWas;
+                return new { file, shownRig, blender.OfficialRigHandControls, blender.SubsurfaceIntensity, blender.BaseSubsurface, blender.SubsurfaceScale, blender.ProfileColour, blender.FurSubsurfaceIntensity, blender.FurSubsurfaceScale };
             });
         }
         if (route == "fork-map-shot")
@@ -316,8 +347,44 @@ public partial class MaterialPorterService
                     shot.Save(file + ".menu.png");
                 }
                 var map = maps.SelectedMap;
-                return new { file, Popup = popup?.Child is not null, items, map.WorldFlagsActors, map.WorldFlagsInstancedFoliage, map.WorldFlagsLandscape, map.WorldFlagsHLODs, map.WorldFlagsLights, map.WorldFlagsDecals, map.WorldFlagsEffects };
+                // sub=Header: that submenu opened; its items, the first toggled, and the map's layer toggles after
+                object? sub = null;
+                if (query["sub"] is { } subHeader && menu.Items.OfType<Avalonia.Controls.MenuItem>().FirstOrDefault(m => m.Header as string == subHeader) is { } parent)
+                {
+                    parent.IsSubMenuOpen = true;
+                    var containers = Enumerable.Range(0, parent.ItemCount).Select(parent.ContainerFromIndex).OfType<Avalonia.Controls.MenuItem>().ToList();
+                    if (containers.Count > 0) containers[0].IsChecked = !containers[0].IsChecked;
+                    sub = new
+                    {
+                        items = containers.Select(c => new { c.Header, c.IsChecked, ToggleType = c.ToggleType.ToString() }),
+                        layers = map.MPLayers.Select(l => new { l.Name, l.IsChecked }),
+                    };
+                }
+                return new { file, Popup = popup?.Child is not null, items, sub, map.WorldFlagsActors, map.WorldFlagsInstancedFoliage, map.WorldFlagsLandscape, map.WorldFlagsHLODs, map.WorldFlagsLights, map.WorldFlagsDecals, map.WorldFlagsEffects, map.WorldFlagsHidden };
             });
+        }
+        if (route == "fork-map-terrain")
+        {
+            // The Map page's Export with Terrain Under Cells and no other flag, to the assets folder: these cells (name=, cells=0;4).
+            var maps = AppServices.MapVM;
+            var map = await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                maps.Maps.First(m => m.MapInfo.Name.Equals(query["name"], StringComparison.OrdinalIgnoreCase)));
+            var excludes = await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                map.IncludeMainLevel = true;
+                map.TerrainUnderCells = true;
+                var off = !map.IncludeMainLevel;
+                map.WorldFlagsActors = map.WorldFlagsHLODs = map.WorldFlagsLights = map.WorldFlagsDecals = map.WorldFlagsEffects = false;
+                foreach (var cell in (query["cells"] ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries).Select(int.Parse))
+                {
+                    map.Grids[cell].IsSelected = true;
+                    foreach (var level in map.Grids[cell].Maps) map.SelectedMaps.Add(level);
+                }
+                maps.ExportLocation = EExportLocation.AssetsFolder;
+                return off;
+            });
+            await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() => map.Export());
+            return new { excludes, left = map.SelectedMaps.Count };
         }
         if (route == "fork-map-preview")
         {
@@ -370,6 +437,53 @@ public partial class MaterialPorterService
                 await AppServices.App.ReloadInstallationAsync();
             });
             return new { reloading = true };
+        }
+        if (route == "fork-files-shot")
+        {
+            // The Files page (flat=1: its flat view, search= typed there), rendered to path= after wait= seconds;
+            // answers how many items the flat view has and lists.
+            var window = AppServices.App.Lifetime.MainWindow!;
+            await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                window.WindowState = Avalonia.Controls.WindowState.Normal;
+                window.Width = 1600;
+                window.Height = 950;
+                AppServices.Navigation.App.Open<Views.FilesView>();
+            });
+            await Task.Delay(2000);
+            var context = AppServices.Services.GetRequiredService<ViewModels.FilesViewModel>().Context;
+            await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                context.UseFlatView = query["flat"] == "1";
+                if (query["search"] is { } search) context.FlatSearchFilter = context.FlatSearchText = search;
+            });
+            await Task.Delay(TimeSpan.FromSeconds(double.TryParse(query["wait"], System.Globalization.CultureInfo.InvariantCulture, out var settle) ? settle : 8));
+            return await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                if (query["path"] is { } file) SaveShot(window, file);
+                return new { flatItems = AppServices.Files.FlatViewAssetCache.Count, listed = context.FlatViewCollection.Count, context.UseFlatView };
+            });
+        }
+        if (route == "fork-mem")
+        {
+            // the process's memory and the managed heap (gc=1: after a full compacting collection, what stays alive)
+            if (query["gc"] == "1")
+            {
+                System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, true, true);
+                GC.WaitForPendingFinalizers();
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, true, true);
+            }
+            using var process = System.Diagnostics.Process.GetCurrentProcess();
+            var info = GC.GetGCMemoryInfo();
+            const double mb = 1 << 20;
+            return new
+            {
+                workingSetMB = process.WorkingSet64 / mb, privateMB = process.PrivateMemorySize64 / mb, peakWorkingSetMB = process.PeakWorkingSet64 / mb,
+                managedMB = GC.GetTotalMemory(false) / mb, heapMB = info.HeapSizeBytes / mb, fragmentedMB = info.FragmentedBytes / mb,
+                committedMB = info.TotalCommittedBytes / mb, generations = info.GenerationInfo.ToArray().Select(g => g.SizeAfterBytes / mb),
+                collections = Enumerable.Range(0, GC.MaxGeneration + 1).Select(GC.CollectionCount),
+            };
         }
         if (route == "fork-status")
         {
@@ -694,6 +808,13 @@ public partial class MaterialPorterService
                 heavy = heavy.OrderByDescending(h => h.Cpu).Take(int.TryParse(query["heavy"], out var top) ? top : 60).Select(h => $"{h.Cpu} {h.Label} = {h.Item.Split(" = ").Last()}"),
             });
         }
+        if (route == "fork-loader-state")
+        {
+            // A tab's loading progress as its page shows it; start=1 starts its load first, without waiting for it.
+            var loader = AppServices.AssetLoading.Get(Enum.Parse<EExportType>(query["type"] ?? "Effect"));
+            if (query["start"] == "1") _ = loader.Load();
+            return JToken.FromObject(new { loaded = loader.LoadedAssets, total = loader.TotalAssets, percent = loader.LoadingPercentageText, loader.FinishedLoading });
+        }
         if (route == "fork-loader")
         {
             // Runs one asset tab's loader as the Assets page does and says what it lists (icons=1: with each one's icon).
@@ -778,7 +899,7 @@ public partial class MaterialPorterService
                 assetData.Exports,
             }));
         }
-        // /fork-export-world?path=<level package>[&landscape=1][&actors=0][&lights=0][&decals=0][&effects=0][&actor=name part]:
+        // /fork-export-world?path=<level package>[&landscape=1][&actors=0][&lights=0][&decals=0][&effects=0][&hidden=1][&actor=name part]:
         // FP's world export of that level (actors and instances, as the Map page sends it to Blender) as the plugin receives it.
         // track=<Rocket Racing track object path>&points=x,y,z;x,y,z...: also lays that track's road along those points.
         if (route != "fork-export-world") return null;
@@ -789,7 +910,7 @@ public partial class MaterialPorterService
                     ?? throw new FileNotFoundException("no world in " + path);
         using var meta = AppServices.AppSettings.ExportSettings.CreateExportMeta(EExportLocation.Blender);
         meta.WorldFlags = (query["actors"] == "0" ? 0 : EWorldFlags.Actors | EWorldFlags.InstancedFoliage) | (query["landscape"] == "1" ? EWorldFlags.Landscape : 0)
-                         | (query["lights"] == "0" ? 0 : EWorldFlags.Lights) | (query["decals"] == "0" ? 0 : EWorldFlags.Decals) | (query["effects"] == "0" ? 0 : EWorldFlags.Effects);
+                         | (query["lights"] == "0" ? 0 : EWorldFlags.Lights) | (query["decals"] == "0" ? 0 : EWorldFlags.Decals) | (query["effects"] == "0" ? 0 : EWorldFlags.Effects) | (query["hidden"] == "1" ? EWorldFlags.Hidden : 0);
         var session = new ExportSession(meta);
         Exporting.Context.ExportContext.MaterialPorterActorFilter = query["actor"];
         if (query["track"] is { } track)

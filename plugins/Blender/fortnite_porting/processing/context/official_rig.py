@@ -11,11 +11,12 @@ import re
 import bpy
 from mathutils import Matrix, Quaternion, Vector
 
-from . import rig_shapes, rig_style
+from . import limb_twist, official_proxies, rig_shapes, rig_style
 
 DATA = os.path.join(os.path.dirname(__file__), "official_rig.json")
 MARK, ON = "fpmp_official_rig", "fpmp_official_rig_on"
 PREFIX = "OR "          # every constraint the rig adds
+HAND = "fpmp_hand_control"     # a control of the extra hand layer (official_hands), not Epic's
 WIDTHS = {"root": 3.5, "limb": 2.5, "digit": 1.5}
 CORE = ("pelvis", "spine_01", "thigh_l", "upperarm_l", "head")
 MCH = "OR_MCH_"         # mechanism bones: the limbs' IK chains, the spine's IK points
@@ -43,6 +44,11 @@ def _shape(name, data):
         mesh.from_pydata([tuple(v) for v in data["shapes"][name]["verts"]], [tuple(e) for e in data["shapes"][name]["edges"]], [])
         obj = bpy.data.objects.new("OR_" + name, mesh)
     return obj
+
+
+def gizmo(name):
+    """One of Epic's gizmo shapes (the official rig's and the kit rigs')."""
+    return _shape(name, load())
 
 
 def _buildable(data, bones):
@@ -243,16 +249,22 @@ def create(obj, data=None):
         rig_style.assign(obj.data, name, "Mechanics")
     _solve(obj, data, names)
     bpy.ops.object.mode_set(mode='OBJECT')
+    driven = {p.name for p in obj.pose.bones if any(c.name.startswith(PREFIX) for c in p.constraints)}
+    rig = names | {b.name for b in obj.data.bones if b.name.startswith((MCH, FOLLOW))}
+    stand_ins = official_proxies.follow(obj, driven, rig)
     for chain in _chains(data, names):      # Epic's defaults: legs in IK, the rest FK (FK where IK couldn't be built)
         ready = _ik_ready(obj, chain["limb"]) if chain.get("limb") else True
         set_switch(obj, chain["switch"], ik=ready and defaults.get(chain["switch"], 0.0) >= 0.5, match=False)
+    limb_twist.build(obj)
+    limb_twist.set_volume(obj, True)
     obj.show_in_front = True
     obj.data[MARK] = True
     obj.data[ON] = True
     ad = obj.animation_data
     if ad is not None and (ad.action is not None or len(ad.nla_tracks)):
         set_on(obj, False)      # the bones are already animated (a lobby pose): they keep playing
-    return "official rig: %d controls" % sum(1 for kind, _ in items if kind == "control")
+    return "official rig: %d controls%s" % (sum(1 for kind, _ in items if kind == "control"),
+                                           "; limbs on %s" % ", ".join(sorted(stand_ins)) if stand_ins else "")
 
 
 def _poles_in_plane(edit, chains):
@@ -421,8 +433,9 @@ def _ik_ready(obj, chain):
 
 
 def setting(obj, name):
-    """An Epic setting's value (a switch, stretch, softness, local, roll blend)."""
-    return obj.pose.bones[name][name]
+    """An Epic setting's value (a switch, stretch, softness, local, roll blend); 0 when the bone lost it."""
+    bone = obj.pose.bones.get(name)
+    return bone.get(name, 0.0) if bone is not None else 0.0
 
 
 def set_setting(obj, name, value):
@@ -438,7 +451,7 @@ def _pole_angle(obj, root, pole):
     projected = normal.cross(axis)
     x = base.matrix_local.to_3x3().col[0]
     angle = x.angle(projected)
-    return -angle if x.cross(projected).angle(axis) < 1.0 else angle
+    return -angle if x.cross(projected).dot(axis) > 0.0 else angle
 
 
 def _chains(data, built):
@@ -652,59 +665,24 @@ def set_body_controls(obj, show):
             pb[name].hide = not show or name in hidden
 
 
-def _toggle(row, obj, name, text):
-    if name in obj.pose.bones:
-        on = setting(obj, name) >= 0.5
-        op = row.operator("fpmp.official_rig_setting", text=text, depress=on)
-        op.name, op.value = name, 0.0 if on else 1.0
-
-
-def ui(layout, obj):
-    """The official rig's panel lines: Rig on/off; per part FK/IK and Epic's settings (stretch, softness, local);
-    foot roll blend; body controls; Bake to Controls."""
-    data = load()
-    pb = obj.pose.bones
-    col = layout.column(align=True)
-    on = bool(obj.data.get(ON, True))
-    col.operator("fpmp.official_rig_on", text="Rig On" if not on else "Rig Off", icon='CONSTRAINT_BONE').on = not on
-    local = {x["space"].split("_")[1] if x["space"].startswith("upperarm") else "neck": x["setting"] for x in data["solve"]["local"]}
-    limbs = {c["switch"]: c for c in data["solve"]["ik"]}
-    for chain in _chains(data, set(pb.keys())):
-        switch = chain["switch"]
-        row = col.row(align=True)
-        row.label(text=switch.replace("_fk_ik_switch", "").replace("_", " ").title())
-        ik = setting(obj, switch) >= 0.5
-        fk_op = row.operator("fpmp.official_rig_switch", text="FK", depress=not ik)
-        fk_op.switch, fk_op.ik = switch, False
-        ik_op = row.operator("fpmp.official_rig_switch", text="IK", depress=ik)
-        ik_op.switch, ik_op.ik = switch, True
-        part = data["solve"]["spine"] if chain.get("part") == "spine" else data["solve"]["neck"] if chain.get("part") else limbs[switch]
-        _toggle(row, obj, part["stretch"], "Stretch")
-        if part.get("softness") and part["softness"] in pb:
-            row.prop(pb[part["softness"]], '["%s"]' % part["softness"], text="Soft")
-        side = switch.split("_")[1] if switch.startswith("arm_") else ("neck" if chain.get("part") == "neck" else None)
-        if side in local:
-            _toggle(row, obj, local[side], "Local")
-    row = col.row(align=True)
-    for roll in data["solve"].get("foot_roll", []):
-        if roll["blend"] in pb:
-            row.prop(pb[roll["blend"]], '["%s"]' % roll["blend"], text="Roll %s" % roll["side"].upper())
-    show = data["solve"]["visibility"]
-    if show in pb:
-        shown = setting(obj, show) >= 0.5
-        col.operator("fpmp.official_rig_body_controls", text="Body Controls", depress=shown).show = not shown
-    col.operator("fpmp.official_rig_bake", text="Bake to Controls", icon='ACTION')
-
-
 def _bake_targets(data, built):
-    """Control: the bone whose pose it takes (FK, copy) for a bake; IK effectors take their limb's end bone."""
+    """Control: the bone whose pose it takes for a bake. FK and copied controls first (they drive the bones during the
+    bake), then the IK side: effectors, the balls and the chest."""
     s = data["solve"]
     pairs = s["copy"] + s["spine"]["fk"] + s["neck"]["fk"] + [p for chain in s["ik"] for p in chain["fk"]]
-    targets = {control: bone for control, bone in pairs if control in built and bone in built}
-    for chain in s["ik"]:
-        if chain["effector"] in built:
-            targets[chain["effector"]] = chain["bones"][2]
+    pairs += [(chain["effector"], chain["bones"][2]) for chain in s["ik"]] + [tuple(c["ball"]) for c in s["ik"] if c.get("ball")]
+    pairs += [(s["spine"]["ik"][-1], s["spine"]["bones"][-1]), (s["neck"]["effector"], s["neck"]["bones"][-1])]
+    targets = {}
+    for control, bone in pairs:
+        if control in built and bone in built:
+            targets.setdefault(control, bone)
     return targets
+
+
+def _bake_rest(data, built, targets):
+    """The IK side's other controls (tangents, foot pivots and roll): keyed at rest for a bake; poles are placed apart."""
+    poles = {chain["pole"] for chain in data["solve"]["ik"]}
+    return [c for chain in _chains(data, built) for c in chain["ik"] if c not in targets and c not in poles]
 
 
 def _settle_order(data, controls, targets):
@@ -712,7 +690,9 @@ def _settle_order(data, controls, targets):
     that follows a bone, the control driving that bone."""
     parent = {i["name"]: i["parent"] for i in data["controls"] + data["spaces"]}
     follow = {s["name"]: s.get("follow") for s in data["spaces"]}
-    driver = {bone: control for control, bone in targets.items()}
+    driver = {}
+    for control, bone in targets.items():       # the FK or copied control: the one driving the bone during a bake
+        driver.setdefault(bone, control)
     wanted, out, seen = set(controls), [], set()
 
     def visit(name, depth=0):
@@ -757,12 +737,14 @@ def _bake(obj, start, end):
     order = [item["name"] for kind, item in _buildable(data, built) if kind == "control"]
     targets = _bake_targets(data, built)
     limbs = [chain for chain in data["solve"]["ik"] if chain["pole"] in built and all(b in built for b in chain["bones"])]
+    chained = _ik_bones(data, built)
     set_on(obj, False)
-    poses = {}
+    poses, bones = {}, {}
     for f in range(start, end + 1):
         scene.frame_set(f)
         poses[f] = {control: _from_bone(obj, control, bone) for control, bone in targets.items()}
         poses[f].update({chain["pole"]: _pole_place(obj, chain) for chain in limbs})
+        bones[f] = {bone: pb[bone].matrix.copy() for bone in chained}
     ad = obj.animation_data or obj.animation_data_create()
     if ad.action is not None:
         track = ad.nla_tracks.new()
@@ -777,24 +759,75 @@ def _bake(obj, start, end):
     # without a depsgraph update (an update re-runs every driver of the armature: the face's thousands)
     rest = {c: (pb[c].parent.bone.matrix_local.inverted() @ pb[c].bone.matrix_local) if pb[c].parent else
             pb[c].bone.matrix_local.copy() for c in keyed}
+    still = _bake_rest(data, built, targets) + [b.name for b in obj.data.bones if b.get(HAND)]
+    held = any(getattr(pb.get("fingers_%s_ctrl" % s), "fpmp_held_prop", None) is not None for s in "lr")
     for f in range(start, end + 1):
         scene.frame_set(f)
         want = poses[f]
+        for control in still:
+            pb[control].matrix_basis = Matrix()
         # spaces follow bones other controls drive (the arm's space rides the clavicle): settle in passes, one update each
         for _ in range(6):
             for control in keyed:
                 parent = pb[control].parent
+                pivot = None if held else _pivot_control(parent, want)
                 above = want[parent.name] if parent is not None and parent.name in want else \
+                    want[pivot] @ pb[pivot].bone.matrix_local.inverted() @ parent.bone.matrix_local if pivot else \
                     (parent.matrix if parent is not None else Matrix())
                 pb[control].matrix_basis = (above @ rest[control]).inverted() @ want[control]
             bpy.context.view_layer.update()
             if all(_lands(pb[c].matrix, want[c]) for c in keyed):
                 break
-        for control in keyed:
+        for control in keyed + still:
             pose_bone = pb[control]
             pose_bone.keyframe_insert("location", frame=f)
             pose_bone.keyframe_insert("rotation_quaternion" if pose_bone.rotation_mode == 'QUATERNION' else "rotation_euler", frame=f)
             pose_bone.keyframe_insert("scale", frame=f)      # emotes scale bones slightly; Copy Transforms carries it
+    _bake_ik_offsets(obj, data, built, bones)
     for chain in _chains(data, built):
         set_switch(obj, chain["switch"], ik=False, match=False)
     return end - start + 1
+
+
+def _pivot_control(bone, want):
+    """The control above a finger's curl pivots and grips (the hand layer, at rest during a bake, so they keep their
+    rest under it), None for any other parent. A fingertip sits nine links below the clavicle: waiting for updates to
+    place them took more passes than a bake makes, and a sprint's tips were keyed 20 cm off."""
+    while bone is not None and bone.name.startswith((MCH + "curl_", MCH + "grip_")):
+        bone = bone.parent
+    return bone.name if bone is not None and bone.name in want else None
+
+
+def _ik_bones(data, built):
+    """The game bones IK poses through a chain bone (MCH pose_), per switched part."""
+    s = data["solve"]
+    parts = {chain["switch"]: chain["bones"] for chain in s["ik"]}
+    parts.update({s[p]["switch"]: s[p]["bones"] for p in ("spine", "neck")})
+    return [b for chain in _chains(data, built) for b in parts[chain["switch"]] if MCH + "pose_" + b in built]
+
+
+def _bake_ik_offsets(obj, data, built, bones):
+    """Key on each chain bone what Epic's IK can't reach from the baked controls (an elbow off its hinge, a forearm's
+    twist, a spine off the curve), so a part switched to IK plays the bake; FK never reads those bones."""
+    pb, scene = obj.pose.bones, bpy.context.scene
+    switches = [chain["switch"] for chain in _chains(data, built)]
+    for switch in switches:
+        pb[switch][switch] = 1.0
+    obj.update_tag()
+    for f, want in bones.items():
+        scene.frame_set(f)
+        # a part rides others (the head's space follows the chest): settle in passes, one update each
+        for _ in range(6):
+            for bone, m in want.items():
+                chain = pb[MCH + "pose_" + bone]
+                aim = Matrix.LocRotScale(m.to_translation(), m.to_quaternion(), chain.matrix.to_scale())
+                chain.matrix_basis = chain.matrix_basis @ chain.matrix.inverted() @ aim
+            bpy.context.view_layer.update()
+            if all(_lands(pb[b].matrix.normalized(), m.normalized()) for b, m in want.items()):
+                break
+        for bone in want:
+            chain = pb[MCH + "pose_" + bone]
+            for path in ("location", "rotation_quaternion", "scale"):
+                chain.keyframe_insert(path, frame=f)
+    for switch in switches:
+        pb[switch][switch] = 0.0

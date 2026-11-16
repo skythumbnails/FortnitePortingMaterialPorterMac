@@ -11,6 +11,7 @@ from .dynamics_solver import Sim, compose, relative
 KEY = "fpmp_dynamics"
 STATE = "fpmp_dynamics_state"       # the movement state whose dynamics parameters apply (emote, standing, skydiving...)
 PREROLL = 1.0       # seconds held on the first pose: in game the character was already idling when the emote began
+WALK_IN = 0.5       # seconds before that, moving from the rest pose (the idle the game's bodies start in) into it
 FLIP = Matrix(((1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, 1.0)))     # the game's axes vs Blender's
 COMPONENT = "__component__"     # a sampled pose's entry for the armature object (the game's mesh component) in the world
 
@@ -62,7 +63,7 @@ class Runner:
 
     def __init__(self, obj, rate=60):
         from ...material_porter.effects import ue_offset
-        self.obj, self.sims = obj, []
+        self.obj, self.sims, self.parts = obj, [], []
         raw = obj.data.get(KEY)
         if not raw:
             return
@@ -99,6 +100,26 @@ class Runner:
         self.twinned = set(self.simulated)
         self.alpha = {b: s.node.get("alpha", 1.0) for s in self.sims for b in s.outputs()}     # the last writer's, for reports
         self.children = {n: [c for c in self.order if parent_of[c] == n] for n in self.order}
+        self.parts = []         # the nodes by part (the body's first), in order
+        for s in self.sims:
+            part = s.node.get("part", 0)
+            if not self.parts or self.parts[-1][0] != part:
+                self.parts.append((part, []))
+            self.parts[-1][1].append(s)
+        self.parts = [sims for _, sims in self.parts]
+        # what each part hands on: its nodes' outputs, and what its rigs move that no other part reads, nor hangs from
+        # (VagueHex's hair rig moves the roots its chains hang from; Riku's body rig turns the head for its collars,
+        # under which the hair hangs)
+        reads = []
+        for sims in self.parts:
+            above = set()
+            for name in {n for s in sims for n in s.bones()}:
+                while name and name not in above:
+                    above.add(name)
+                    name = parent_of.get(name)
+            reads.append(above)
+        self.outputs = [{n for s in sims for n in s.outputs()} for sims in self.parts]
+        self.shared = [set().union(*(r for i, r in enumerate(reads) if i != k)) for k in range(len(self.parts))]
         scene = obj.users_scene[0] if obj.users_scene else bpy.context.scene
         fps = scene.render.fps / scene.render.fps_base
         self.steps = max(1, round(rate / fps))
@@ -123,24 +144,48 @@ class Runner:
         for n in self.order:
             cs[n] = compose(loc[n], cs[parent_of[n]]) if parent_of[n] in cs else loc[n]
         self._wind()
-        for s in self.sims:
-            for name, t in s.evaluate(self.dt, cs, self.root).items():
-                a, par = s.node.get("alpha", 1.0), cs.get(parent_of[name])        # each node blends its own result
-                if a < 1e-5:
-                    continue
-                local = relative(t, par) if par else t
-                if a < 1.0 - 1e-5:      # the engine blends a partial node in the bone's local space
-                    local = blend(loc[name], local, a)
-                loc[name] = local
-                cs[name] = compose(local, par) if par else local
-                stack = list(self.children[name])
-                while stack:            # its children follow from their own locals
-                    c = stack.pop()
-                    cs[c] = compose(loc[c], cs[parent_of[c]])
-                    stack += self.children[c]
+        for k, sims in enumerate(self.parts):
+            # each part's anim blueprint runs on its own copy of the pose: the next parts see the bones it hands on,
+            # not what its rigs change for its own nodes (Riku's body rig turns the head for the collars, not the hair)
+            part_loc, part_cs = (dict(loc), dict(cs)) if len(self.parts) > 1 else (loc, cs)
+            moved = set()
+            for s in sims:
+                changed = self._apply(s, part_loc, part_cs)
+                if hasattr(s, "restrict"):      # a rig: what it moves
+                    moved |= changed
+            if part_loc is not loc:
+                handed = self.outputs[k] | {n for n in moved if n not in self.shared[k]}
+                for name in sorted((n for n in handed if n in part_loc), key=self.order.index):
+                    loc[name] = part_loc[name]
+                    self._settle(name, loc, cs)
         for c in self.clothes:      # the engine simulates cloth from the finished pose
             c["out"] = [s.step(self.dt, cs, self.component) for s in c["sims"]]
         return cs
+
+    def _apply(self, s, loc, cs):
+        """One node's result into the pose; the bones it set."""
+        parent_of, done = self.parent_of, set()
+        for name, t in s.evaluate(self.dt, cs, self.root).items():
+            a, par = s.node.get("alpha", 1.0), cs.get(parent_of[name])        # each node blends its own result
+            if a < 1e-5:
+                continue
+            local = relative(t, par) if par else t
+            if a < 1.0 - 1e-5:      # the engine blends a partial node in the bone's local space
+                local = blend(loc[name], local, a)
+            loc[name] = local
+            self._settle(name, loc, cs)
+            done.add(name)
+        return done
+
+    def _settle(self, name, loc, cs):
+        """A bone's global and its children's from their locals."""
+        par = cs.get(self.parent_of[name])
+        cs[name] = compose(loc[name], par) if par else loc[name]
+        stack = list(self.children[name])
+        while stack:
+            c = stack.pop()
+            cs[c] = compose(loc[c], cs[self.parent_of[c]])
+            stack += self.children[c]
 
     def cloth(self):
         """The last tick's cloth by mesh id: its render slots in component space (cm, the game's axes)."""
@@ -176,13 +221,27 @@ class Runner:
                 s.component_motion = motion
 
     def start(self, loc):
-        """The first frame: the bodies settle on it for the pre-roll."""
+        """The first frame: the bodies start at the rest pose, move into the frame, then settle on it for the pre-roll.
+        Starting on the frame itself hands them its overlaps as starting ones, which they keep: a clip starting
+        mid-stride let the legs through QuaintToy's skirt."""
         self.component_velocity = Vector()
         self._component(None)
         self.component = loc.get(COMPONENT, self.component)
+        rest, walk = self._rest(loc), round(WALK_IN / self.dt)
+        for k in range(walk):
+            self.tick({n: blend(rest[n], loc[n], k / walk) for n in loc})
         for _ in range(round(PREROLL / self.dt)):
             cs = self.tick(loc)
         return cs
+
+    def _rest(self, loc):
+        """The rest pose as a sampled one (locals in the game's numbers), on loc's component."""
+        bones = self.obj.data.bones
+        cs = {n: to_game(bones[n].matrix_local, self.offsets[n], self.unit) for n in self.order}
+        rest = {n: relative(cs[n], cs[self.parent_of[n]]) if self.parent_of[n] in cs else cs[n] for n in self.order}
+        if COMPONENT in loc:
+            rest[COMPONENT] = loc[COMPONENT]
+        return rest
 
     def advance(self, prev, loc):
         """One frame on, ticking through poses interpolated from the last frame's."""

@@ -22,11 +22,6 @@ public enum EExportLocation
     [Description("Custom Folder")]
     [Icon(MaterialIconKind.FolderEdit)]
     CustomFolder,
-
-    [Description("Unity (Not Implemented)")]
-    [Icon(MaterialIconKind.Unity)]
-    [Disabled]
-    Unity,
 }
 
 public enum EExportType
@@ -288,6 +283,7 @@ public enum EWorldFlags
     Lights = 1 << 5,     // MP
     Decals = 1 << 6,
     Effects = 1 << 7,
+    Hidden = 1 << 8,     // MP: hidden actors too (the plugin's Hidden collection)
 }
 
 file static class ExportCategory

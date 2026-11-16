@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using FortnitePorting.Exporting.Models;
 using FortnitePorting.Exporting.Providers;
@@ -22,6 +23,9 @@ public class ExportDataMeta : IDisposable
     [JsonIgnore] public EExportLocation ExportLocation;
     [JsonIgnore] public string? CustomPath;
     [JsonIgnore] public string? ActorFilter;     // MP: Map page "Only actors named" (null: all)
+    [JsonIgnore] public List<string>? MPLevels;     // MP: packages a world export reads in place of its level (an editor map's actors)
+    [JsonIgnore] public Dictionary<string, string>? MPLayerOf;     // MP: of those, the ones a data layer adds -> its name
+    [JsonIgnore] public List<FortnitePorting.Exporting.MaterialPorter.TerrainArea>? MPTerrainAreas;     // MP: only landscape pieces touching these (null: all)
     [JsonIgnore] public EWorldFlags WorldFlags = EWorldFlags.Actors | EWorldFlags.WorldPartitionGrids | EWorldFlags.Landscape | EWorldFlags.InstancedFoliage | EWorldFlags.HLODs | EWorldFlags.Lights | EWorldFlags.Decals | EWorldFlags.Effects;
     [JsonIgnore] public IExportAssetProvider Provider = null!;
 

@@ -8,6 +8,7 @@ from ..processing.enums import EExportType
 from ..processing.material.enums import ENodeType
 from ..processing.material.mappings import DefaultMappings
 from ..processing.material.mappings_registry import find_all_matching_mappings
+from ..processing.material.names import toon_outline_disable_names, toon_outline_names
 from ..processing.material.utils import get_param
 from ..utils import any, hash_code
 
@@ -24,10 +25,23 @@ def has_fp_shader(material_data):
     return any(material_data.get("Textures") or [], lambda t: (t.get("Name") or "").casefold() in diffuse)
 
 
+_toon = {}      # FP's mappings match on parameter names only: answers by those names (a map asks for every slot)
+
+
 def is_toon(material_data):
     """Whether FP picks its toon shader (the last matching mapping). Such materials get FP's outline whoever builds them."""
-    mappings = find_all_matching_mappings(material_data)
-    return bool(mappings) and mappings[-1].node_name == "FPv4 Base Toon"
+    key = tuple(tuple(sorted(str(p.get("Name")) for p in material_data.get(kind) or []))
+                for kind in ("Textures", "Scalars", "Vectors", "Switches", "ComponentMasks"))
+    if key not in _toon:
+        mappings = find_all_matching_mappings(material_data)
+        _toon[key] = bool(mappings) and mappings[-1].node_name == "FPv4 Base Toon"
+    return _toon[key]
+
+
+def is_outline_shell(material_data):
+    """An inverted-hull outline slot of the mesh (FP hides these and draws its own outline)."""
+    name = material_data.get("Name") or ""
+    return any(toon_outline_names, lambda x: x in name) and not any(toon_outline_disable_names, lambda x: x in name)
 
 
 class ExactChoice:
@@ -35,19 +49,33 @@ class ExactChoice:
     texture cap) isn't reused."""
 
     def __init__(self, ctx, material_data, material_slot, as_material_data):
-        from .hook import cosmetic_material, subsurface as subsurface_of, texture_cap
+        from .hook import cosmetic_material, exact_available, subsurface as subsurface_of, texture_cap
+        from .landscape_layers import key as layers_key
         self.ctx = ctx
+        # this slot's line in the import's log (progress.py), when an import is logging one
+        self.record = getattr(ctx, "mp_material", None)
+        if self.record is not None:
+            self.record["name"] = material_data.get("Name")
+        self.hidden = bool(material_data.get("MPHidden"))
         self.prefer_fp = bool(ctx.options.get("PreferFPShaders") and ctx.type in FP_SHADER_TYPES and has_fp_shader(material_data))
+        if is_outline_shell(material_data) and exact_available(ctx) and not self.prefer_fp:
+            # the game's own outline shell is built, its World Position Offset pushing it out, rather than hidden
+            material_data.update(MPMoves=True, MPOutline=True)
         self.rim_light = bool(ctx.options.get("RimLight"))
         self.texture_cap = texture_cap(ctx)
         self.subsurface = "%g %g %g %g %s" % (tuple(subsurface_of(ctx, material_data)) + (cosmetic_material(ctx, material_data),))
         # a landscape proxy gets one material per set of painted layers (see hook.build_exact)
         slot_object = None if as_material_data else material_slot.id_data
-        self.landscape = "+".join(sorted(a.name for a in slot_object.data.color_attributes if a.name != "COL0")) \
+        self.landscape = layers_key(slot_object) \
             if slot_object is not None and slot_object.type == 'MESH' and slot_object.get("mp_landscape") else None
 
+    def _outcome(self, text):
+        if self.record is not None:
+            self.record["outcome"] = text
+
     def reusable(self, existing):
-        return (bool(existing.get("MPPreferFP")) == self.prefer_fp
+        # a section the game doesn't draw is hidden again, not given a drawn one's material
+        return (not self.hidden and bool(existing.get("MPPreferFP")) == self.prefer_fp
                 and bool(existing.get("MPRimLight", self.rim_light)) == self.rim_light
                 and existing.get("MPSubsurface", self.subsurface) == self.subsurface
                 and existing.get("MPLandscapeLayers") == self.landscape
@@ -56,6 +84,7 @@ class ExactChoice:
     def reused(self, material_slot, existing, material_data):
         """A reused material still needs this mesh's UV maps, outline and hidden elements."""
         from .placement import ensure_slot_uvs
+        self._outcome("reused")
         ensure_slot_uvs(material_slot, existing)
         if is_toon(material_data):
             self.ctx.add_toon_outline = True
@@ -67,6 +96,7 @@ class ExactChoice:
         from .hook import exact_available
         if self.prefer_fp:
             material["MPPreferFP"] = True
+            self._outcome("FP shader, preferred")
         return exact_available(self.ctx) and not self.prefer_fp and getattr(self.ctx, "type", None) != EExportType.TIME_OF_DAY
 
     def build(self, material, material_data, meta, override_parameters, material_slot, as_material_data,
@@ -77,6 +107,7 @@ class ExactChoice:
                             None if as_material_data else material_slot.id_data)
         if not exact:
             return False
+        self._outcome("exact")
         # outline is FP's: a Solidify shell drawn with M_FP_Outline
         if is_toon(material_data):
             self.ctx.add_toon_outline = True

@@ -1,9 +1,16 @@
 #nullable disable
+using global::CUE4Parse.UE4.Assets;
+using global::CUE4Parse.UE4.Assets.Exports;
 using global::CUE4Parse.UE4.Assets.Exports.Texture;
+using global::CUE4Parse.UE4.Assets.Objects;
+using global::CUE4Parse.UE4.Objects.Engine;
+using global::CUE4Parse.UE4.Objects.UObject;
 using global::CUE4Parse_Conversion.Options;
 using global::CUE4Parse_Conversion.Textures;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using FortnitePorting.CUE4Parse.Extensions;
+using FortnitePorting.Shared.Options;
 
 namespace FortnitePorting.MaterialPorter;
 
@@ -95,6 +102,35 @@ public sealed class MaterialService
         string.Join("~", key.Replace(".o.uasset", "").Replace(".uasset", "").Split('/', StringSplitOptions.RemoveEmptyEntries));
 
     // ------------------------------------------------------------ paths
+    /// <summary>The key of the package holding path's editor-only half: its old "<path>.o.uasset", or (CUE4Parse since
+    /// October 2026) the cooked package its optional segment is merged into; null if the game has neither.</summary>
+    public string? EditorKey(string path)
+    {
+        if (ResolveKey(path, ".o.uasset") is { } old) return old;
+        if (ResolveKey(path, ".uasset") is not { } key) return null;
+        var files = game.Provider.Files;
+        if (files.TryGetValue(key, out var loose) && IsLoose(loose)) return key;     // an uncooked package holds its own graph
+        return files.TryGetValue(key, out var f) && f is global::CUE4Parse.UE4.IO.Objects.FIoStoreEntry entry &&
+               files.TryGetOptionalSegmentPackage(entry.ChunkId.AsPackageId(), out _) ? key : null;
+    }
+
+    // A package read from a file on disk (an uncooked one, e.g. a UEFN project's), not from the game's containers.
+    static bool IsLoose(global::CUE4Parse.FileProvider.Objects.GameFile file) =>
+        file is global::CUE4Parse.FileProvider.Objects.OsGameFile;
+
+    /// <summary>The editor-only exports of EditorKey's package (what an .o.uasset holds): its optional segment loaded on its
+    /// own, as the .o.uasset was (merged into the cooked package, its references to the cooked half come out unresolved).</summary>
+    async Task<List<global::CUE4Parse.UE4.Assets.Exports.UObject>> EditorExportsAsync(string key)
+    {
+        var files = game.Provider.Files;
+        if (files.TryGetValue(key, out var loose) && IsLoose(loose))
+            return (await game.Provider.LoadPackageAsync(key)).GetExports().Where(e => !NotGraph.Contains(e.ExportType)).ToList();
+        if (!key.EndsWith(".o.uasset", StringComparison.OrdinalIgnoreCase) && files.TryGetValue(key, out var f) &&
+            f is global::CUE4Parse.UE4.IO.Objects.FIoStoreEntry entry && files.TryGetOptionalSegmentPackage(entry.ChunkId.AsPackageId(), out var segment))
+            return (await game.Provider.LoadPackageAsync(segment)).GetExports().ToList();
+        return (await game.Provider.LoadPackageAsync(key)).GetExports().ToList();
+    }
+
     /// <summary>Resolves "/Game/..", "/Engine/..", "/Plugin/..", "Pkg.Object", "Pkg.0" or a file key to the file key of "package+ext", if the game has it.</summary>
     public string ResolveKey(string p, string ext)
     {
@@ -123,6 +159,8 @@ public sealed class MaterialService
             var scan = p + "|" + ext;
             if (mountScans.TryGetValue(scan, out var seen) && seen.Files == provider.Files.Count) return seen.Key;
             var parts = p.Trim('/').Split('/');
+            // a mount FixPath knows was tried above (an island's missing .o.uasset walked 4 M keys, ~150 ms each)
+            if (provider.VirtualPaths.ContainsKey(parts[0])) return null;
             var tail = "/" + string.Join('/', parts.Skip(1)) + ext;
             var hit = provider.Files.Keys.FirstOrDefault(k => k.EndsWith(tail, StringComparison.OrdinalIgnoreCase)
                                                              && k.Contains("/" + parts[0] + "/", StringComparison.OrdinalIgnoreCase));
@@ -170,7 +208,7 @@ public sealed class MaterialService
     /// <summary>The expression graph of a material or function (in the editor-only .o.uasset), dumped as ue_graph reads it.</summary>
     public Task<string> GraphAsync(string path) => Locked(async () =>
     {
-        var key = ResolveKey(path, ".o.uasset");
+        var key = EditorKey(path);
         if (key == null)
         {
             // an island's own master or function: the cooked pak has no editor graph, the creator's project does
@@ -178,9 +216,10 @@ public sealed class MaterialService
             throw new FileNotFoundException("No editor graph for " + path);
         }
         var file = System.IO.Path.Combine(Dir("graphs"), Safe(key) + ".json");
-        if (File.Exists(file)) return file;
-        var pkg = await game.Provider.LoadPackageAsync(key);
-        await File.WriteAllTextAsync(file, JsonConvert.SerializeObject(pkg.GetExports().ToArray(), Formatting.None, Ser));
+        // a loose package's graph is redone when its file changed (a project edited in UEFN)
+        if (File.Exists(file) && !(game.Provider.Files.TryGetValue(key, out var source) && source is global::CUE4Parse.FileProvider.Objects.OsGameFile os
+                                   && File.GetLastWriteTimeUtc(os.ActualFile.FullName) > File.GetLastWriteTimeUtc(file))) return file;
+        await File.WriteAllTextAsync(file, JsonConvert.SerializeObject((await EditorExportsAsync(key)).ToArray(), Formatting.None, Ser));
         return file;
     });
 
@@ -216,9 +255,10 @@ public sealed class MaterialService
     public async Task<MaterialInfo> DescribeAsync(string path)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var info = await Locked(() => ChainAsync(path));
+        // the chain only reads packages: Blender's parallel prefetch of an import's materials runs these side by side
+        var info = await ChainAsync(path);
         await Locked(async () => { SkyValues(info, await DayValuesAsync()); return true; });
-        if (info.Master != null && ResolveKey(info.Master, ".o.uasset") == null)
+        if (info.Master != null && EditorKey(info.Master) == null)
         {
             // an island's own master: the creator's project if set up and it has it, else an approximation
             var project = await Locked(() => ProjectGraphAsync(info.Master));
@@ -309,9 +349,9 @@ public sealed class MaterialService
         {
             if (await game.Provider.LoadPackageObjectAsync(info.Master) is global::CUE4Parse.UE4.Assets.Exports.Material.UMaterial m)
             {
-                var list = new List<global::CUE4Parse.UE4.Assets.Exports.Material.UUnrealMaterial>();
+                var list = new List<global::CUE4Parse.UE4.Objects.UObject.FPackageIndex>();
                 m.AppendReferencedTextures(list, false);
-                foreach (var t in list.OfType<UTexture>().Concat(ImportedTextures(m)))
+                foreach (var t in list.Select(i => i.LoadOrDefault<UTexture>()).OfType<UTexture>().Concat(ImportedTextures(m)))
                     if (t.GetPathName() is { } tp && !info.ReferencedTextures.Contains(tp)) info.ReferencedTextures.Add(tp);
                 // what the compiled shader really uses (its shader map): textures sampled, parameters read
                 info.Shader = ShaderMapHints.For(ShaderMapHints.From(game.Provider, info.Master, m, info.ReferencedTextures), info.Scalars, info.Vectors);
@@ -367,15 +407,15 @@ public sealed class MaterialService
     // them a mask fell back to its default. A mask the instance doesn't override (bOverride false) is left to its parent.
     async Task EditorMasksAsync(string path, MaterialInfo info)
     {
-        var key = ResolveKey(path, ".o.uasset");
+        var key = EditorKey(path);
         // an island's instance has no editor package in the cooked pak: use the creator's project's
         var hit = key == null ? IslandProjects.Find(game.Provider, path) : null;
         if (key == null && hit == null) return;
         try
         {
-            var pkg = hit == null ? await game.Provider.LoadPackageAsync(key)
-                                  : await hit.Project.Provider.LoadPackageAsync(hit.Project.KeyOf(hit.Rel) ?? throw new FileNotFoundException(hit.Rel));
-            var ed = pkg.GetExports().FirstOrDefault(e => e.ExportType == "MaterialInstanceEditorOnlyData");
+            var exports = hit == null ? await EditorExportsAsync(key!)
+                                      : (await hit.Project.Provider.LoadPackageAsync(hit.Project.KeyOf(hit.Rel) ?? throw new FileNotFoundException(hit.Rel))).GetExports();
+            var ed = exports.FirstOrDefault(e => e.ExportType == "MaterialInstanceEditorOnlyData");
             if (ed == null) return;
             var sp = JObject.Parse(JsonConvert.SerializeObject(ed, Ser))["Properties"]?["StaticParameters"];
             foreach (var e in sp?["StaticComponentMaskParameters"] ?? new JArray())
@@ -556,7 +596,12 @@ public sealed class MaterialService
             if (File.Exists(meta))
             {
                 var rec = JsonConvert.DeserializeObject<CachedTexture>(await File.ReadAllTextAsync(meta));
-                if (rec?.Version == TextureCacheVersion && rec.Texture != null && File.Exists(rec.Texture.File) && rec.Texture.Width >= full)
+                // a non-BC5 normal map once copied raw lacks X in alpha: made again
+                var unpacked = tex.IsNormalMap && rec?.Texture?.File?.EndsWith(".dds") == true && rec.Texture.Format != "PF_BC5";
+                // an array once cached as its first slice only (a tall slice counted as several): made again
+                var sliced = tex is UTexture2DArray && rec?.Texture is { } t && tex.PlatformData?.Mips?.FirstOrDefault() is { SizeZ: > 0 } m
+                             && (t.Depth != m.SizeZ || (long) t.Height * m.SizeX != (long) t.Width * m.SizeY * t.Depth);
+                if (rec?.Version == TextureCacheVersion && rec.Texture != null && File.Exists(rec.Texture.File) && rec.Texture.Width >= full && !unpacked && !sliced)
                 {
                     Timing.Log($"texture {Bridge.ShortName(path)} (cached)", sw);
                     return Sampling(rec.Texture, tex);
@@ -565,8 +610,10 @@ public sealed class MaterialService
         }
         catch { /* a broken record: export again */ }
 
-        // the mip's own data, when Blender reads its format: no decode or encode
-        if (raw && tex is UTexture2D t2 && t2.PlatformData is { } pd && pd.VTData == null && RawFormats.TryGetValue(pd.PixelFormat ?? "", out var dxgi))
+        // the mip's own data, when Blender reads its format: no decode or encode. Normal maps only as BC5, the one
+        // raw format repacked with X in alpha (UEFN project ones arrive as BGRA8 decoded from their source)
+        if (raw && tex is UTexture2D t2 && t2.PlatformData is { } pd && pd.VTData == null && RawFormats.TryGetValue(pd.PixelFormat ?? "", out var dxgi)
+            && (!tex.IsNormalMap || dxgi == 83))
         {
             try
             {
@@ -575,7 +622,7 @@ public sealed class MaterialService
                 {
                     var file = stem + ".dds";
                     // a BC5 normal map as DXT5 (X in alpha): kept compressed on the GPU, with its mips
-                    var packNormal = tex.IsNormalMap && dxgi == 83;
+                    var packNormal = tex.IsNormalMap;
                     if (packNormal) dxgi = 77;
                     // the smaller mips after it, while each exists and is half the one before
                     var chain = new List<byte[]> { packNormal ? NormalPacking.Bc5ToDxt5(bytes) : bytes };
@@ -601,7 +648,9 @@ public sealed class MaterialService
         try
         {
             var tLoad = sw.Elapsed.TotalMilliseconds;
-            var ct = (cap > 0 ? TextureDecoder.Decode(tex, cap, ETexturePlatform.DesktopMobile) : tex.Decode(ETexturePlatform.DesktopMobile))
+            var slices = 1;
+            var ct = (tex is UTexture2DArray array ? StackSlices(array, cap, out slices)
+                         : cap > 0 ? TextureDecoder.Decode(tex, cap, SharedExportOptions.Default) : tex.Decode(SharedExportOptions.Default))
                      ?? throw new InvalidDataException("Could not decode " + path);
             var tDecode = sw.Elapsed.TotalMilliseconds;
             if (raw && tex.IsNormalMap) NormalPacking.RedToAlpha(ct);     // Blender reads every normal map's X from alpha
@@ -616,7 +665,7 @@ public sealed class MaterialService
                 UTexture2DArray => "array",
                 _ => "2d",
             };
-            var depth = kind is "volume" or "array" && ct.Width > 0 ? Math.Max(1, ct.Height / ct.Width) : 1;
+            var depth = kind == "array" ? slices : kind == "volume" && ct.Width > 0 ? Math.Max(1, ct.Height / ct.Width) : 1;
             var result = Sampling(new TextureFile
             {
                 File = file, Srgb = tex.SRGB, Width = ct.Width, Height = ct.Height, Kind = kind, Depth = depth,
@@ -627,6 +676,16 @@ public sealed class MaterialService
             return result;
         }
         finally { encoders.Release(); }
+    }
+
+    // CUE4Parse's plain Decode keeps an array's first slice only; the plugin reads all of them as one vertical stack,
+    // slice 0 on top (LEGO faces keep their lashes in slice 2 of the eye atlas)
+    static CTexture? StackSlices(UTexture2DArray tex, int cap, out int count)
+    {
+        var slices = tex.DecodeTextureArray(cap > 0 ? tex.GetMipIndexByMaxSize(cap) : tex.GetFirstMipIndex(), SharedExportOptions.Default);
+        count = slices?.Length ?? 0;
+        if (slices is not { Length: > 0 } || slices.Any(s => s == null)) return null;
+        return new CTexture(slices[0].Width, slices[0].Height * slices.Length, slices[0].PixelFormat, slices.SelectMany(s => s.Data).ToArray());
     }
 
     // A record's sampler state, read from the texture each time (cached records predate some of it).
@@ -743,9 +802,72 @@ public sealed class MaterialService
 
     DayValues day;
 
-    // The season's day sequence (newest DS_BR_Ch<n>S<n>) evaluated at TimeOfDay: its parameter collection track and
-    // its sky mesh's material tracks. The sequence is one day long (playback range 24 in-game hours); channel keys
-    // are cubic, linear or constant, held before the first and after the last.
+    (object Provider, List<IPackage> Packages) daySequences;
+
+    // The season's day sequences, lowest bias first (a higher one wins a track both key): what the current island plays,
+    // else the newest DS_BR_Ch<n>S<n> for a build whose map data doesn't say.
+    async Task<List<IPackage>> DaySequencesAsync()
+    {
+        if (daySequences.Provider == game.Provider) return daySequences.Packages;
+        var packages = await IslandSequencesAsync();
+        if (packages == null || packages.Count == 0)
+        {
+            var key = game.Provider.Files.Keys
+                .Select(k => (Key: k, M: System.Text.RegularExpressions.Regex.Match(System.IO.Path.GetFileName(k), @"^DS_BR_Ch(\d+)S(\d+)\.uasset$", System.Text.RegularExpressions.RegexOptions.IgnoreCase)))
+                .Where(x => x.M.Success)
+                .OrderByDescending(x => int.Parse(x.M.Groups[1].Value)).ThenByDescending(x => int.Parse(x.M.Groups[2].Value))
+                .Select(x => x.Key).FirstOrDefault();
+            packages = key != null ? [await game.Provider.LoadPackageAsync(key)] : [];
+        }
+        daySequences = (game.Provider, packages);
+        return packages;
+    }
+
+    // Battle Royale's map (the one map UI data under the Apollo minimap material names) -> its world settings'
+    // WorldTimeOfDayManager -> the nearest class's DaySequenceCollections -> their sequences without a condition
+    // (the rest are scalability's). Null when the build's data doesn't lead there.
+    async Task<List<IPackage>> IslandSequencesAsync()
+    {
+        try
+        {
+            var maps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var file in game.Provider.Files.Keys.Where(f => f.Contains("/Content/UI/IngameMap/", StringComparison.OrdinalIgnoreCase)
+                                                                     && f.EndsWith("MapUIData.uasset", StringComparison.OrdinalIgnoreCase)).ToList())
+            {
+                var data = (await game.Provider.LoadPackageAsync(file)).GetExports().FirstOrDefault(e => e.ExportType == "FortMapUIData");
+                if (data != null && data.TryGetValue(out string map, "MapPath") && data.TryGetValue(out FSoftObjectPath material, "MapMaterial")
+                    && material.AssetPathName.Text.Contains("Apollo", StringComparison.OrdinalIgnoreCase))
+                    maps.Add(map);
+            }
+            if (maps.Count != 1) return null;
+            var world = (await game.Provider.LoadPackageAsync(maps.Single())).GetExports().FirstOrDefault(e => e.ExportType.EndsWith("WorldSettings"));
+            if (world == null || !world.TryGetValue(out FSoftObjectPath manager, "WorldTimeOfDayManager")) return null;
+            var sequences = new List<(int Bias, IPackage Package)>();
+            for (var cls = await manager.LoadAsync() as UBlueprintGeneratedClass; cls != null; cls = cls.SuperStruct?.Load<UStruct>() as UBlueprintGeneratedClass)
+            {
+                if (cls.ClassDefaultObject is not { } cdoRef || !cdoRef.TryLoad(out var cdo) || cdo == null) continue;
+                if (!cdo.TryGetValue(out UObject[] collections, "DaySequenceCollections")) continue;
+                foreach (var collection in collections.Where(c => c != null))
+                    foreach (var entry in collection.GetOrDefault("DaySequences", Array.Empty<FStructFallback>()))
+                    {
+                        if (entry.GetOrDefault<FStructFallback>("Conditions")?.GetOrDefault<UScriptMap>("Conditions") is { Properties.Count: > 0 }) continue;
+                        if (entry.TryGetValue(out UObject sequence, "Sequence") && sequence?.Owner is { } package)
+                            sequences.Add((entry.GetOrDefault("BiasOffset", 0), package));
+                    }
+                break;
+            }
+            return sequences.OrderBy(s => s.Bias).Select(s => s.Package).ToList();
+        }
+        catch (Exception e)
+        {
+            Serilog.Log.Warning("[Material Porter] time of day: the island's day sequences didn't read ({Error})", e.Message);
+            return null;
+        }
+    }
+
+    // The season's day sequences evaluated at TimeOfDay: their parameter collection tracks and their sky mesh's
+    // material tracks. A sequence is one day long (playback range 24 in-game hours); channel keys are cubic, linear
+    // or constant, held before the first and after the last.
     async Task<DayValues> DayValuesAsync()
     {
         if (day != null && day.Hour == TimeOfDay) return day;
@@ -753,14 +875,9 @@ public sealed class MaterialService
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            var key = game.Provider.Files.Keys
-                .Select(k => (Key: k, M: System.Text.RegularExpressions.Regex.Match(System.IO.Path.GetFileName(k), @"^DS_BR_Ch(\d+)S(\d+)\.uasset$", System.Text.RegularExpressions.RegexOptions.IgnoreCase)))
-                .Where(x => x.M.Success)
-                .OrderByDescending(x => int.Parse(x.M.Groups[1].Value)).ThenByDescending(x => int.Parse(x.M.Groups[2].Value))
-                .Select(x => x.Key).FirstOrDefault();
-            if (key != null)
+            var packages = await DaySequencesAsync();
+            foreach (var pkg in packages)
             {
-                var pkg = await game.Provider.LoadPackageAsync(key);
                 // by export index: a sequence's names repeat (each track's section is "..._0")
                 var exports = pkg.GetExports().Select(e => JObject.Parse(JsonConvert.SerializeObject(e, Ser))).ToList();
                 var movie = exports.FirstOrDefault(e => (string)e["Type"] == "MovieScene")?["Properties"];
@@ -792,11 +909,13 @@ public sealed class MaterialService
                         }
                     }
                 }
-                Timing.Log($"time of day {TimeOfDay:0.#} h from {System.IO.Path.GetFileNameWithoutExtension(key)}: {values.Collections.Sum(c => c.Value.Scalars.Count + c.Value.Vectors.Count)} collection and " +
-                           $"{values.Slots.Sum(c => c.Value.Scalars.Count + c.Value.Vectors.Count)} sky values", sw);
             }
+            if (packages.Count > 0)
+                Serilog.Log.Information("[Material Porter] time of day {Hour:0.#} h from {Sequences}: {Collection} collection and {Sky} sky values ({Ms:0} ms)", TimeOfDay,
+                    string.Join(", ", packages.Select(p => p.Name.Split('/').Last())), values.Collections.Sum(c => c.Value.Scalars.Count + c.Value.Vectors.Count),
+                    values.Slots.Sum(c => c.Value.Scalars.Count + c.Value.Vectors.Count), sw.Elapsed.TotalMilliseconds);
         }
-        catch (Exception e) { Timing.Log("time of day: the day sequence didn't read (" + e.Message + ")", sw); }
+        catch (Exception e) { Serilog.Log.Warning("[Material Porter] time of day: the day sequence didn't read ({Error})", e.Message); }
         return day = values;
     }
 

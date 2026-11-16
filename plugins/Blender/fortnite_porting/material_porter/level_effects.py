@@ -107,6 +107,10 @@ def _place(context, entry, name):
     place.scale = make_vector(entry.get("Scale") or {"X": 1.0, "Y": 1.0, "Z": 1.0})
     place["mp_level_effect"] = str(entry.get("Name") or "")
     place["mp_level_system"] = str(entry.get("System") or "")
+    if entry.get("MPHidden"):
+        place["mp_hidden"] = 1.0
+    if entry.get("MPLayer"):
+        place["mp_layer"] = str(entry["MPLayer"])
     context.collection.objects.link(place)
     return place
 

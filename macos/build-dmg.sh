@@ -15,9 +15,8 @@ DOTNET="${DOTNET:-dotnet}"
 VERSION="$(sed -n 's#.*<Version>\(.*\)</Version>.*#\1#p' "$ROOT/src/FortnitePorting/FortnitePorting.csproj" | head -1)"
 BUILD="${VERSION##*.}"
 
-# The CUE4Parse fixes this fork carries, laid over the submodule (the fork's FSpline.cs and static mesh reading, the
-# Mac patch's IoChunkToc.cs and CMakeLists.txt, the lock-free file lookups, the fast PNG export and the usmap v5 reader)
-# (by content, so a rebuild leaves the submodule untouched)
+# The CUE4Parse fixes this fork carries, laid over the submodule (the fork's own, and the Mac patch's IoChunkToc.cs,
+# CMakeLists.txt and lock-free file lookups) (by content, so a rebuild leaves the submodule untouched)
 rsync -rc "$ROOT/patches/CUE4Parse/" "$ROOT/external/CUE4Parse/"
 
 WORK="$(mktemp -d)"

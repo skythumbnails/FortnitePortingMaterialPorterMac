@@ -85,8 +85,9 @@ public class AssetItem : Base.BaseAssetItem
         // Everything the grid needs (rarity, set, season, series, icon path) is now captured, so
         // drop the parsed asset object. It re-parses on demand for export/preview/styles. This is
         // the main lever that keeps a loaded tab from pinning thousands of parsed UObjects in RAM.
-        CreationData.CaptureFilterMetadata();
-        CreationData.ReleaseObject();
+        // MP: not an unloaded listing (effects, animations): it is already only a name and an outline, and its filters,
+        // name and description read that outline; reloading it would read the whole asset
+        if (!FortnitePorting.Exporting.MaterialPorter.Unloaded.Is(CreationData.Object!)) CreationData.ReleaseObject();
     }
 
     // Grid thumbnails render small — cap decodes at 256px (4-16x less memory than native icon res).
@@ -104,7 +105,8 @@ public class AssetItem : Base.BaseAssetItem
 
     public async Task LoadBitmapAsync()
     {
-        if (CreationData.IconPath is not { } iconPath) return;
+        var iconPath = CreationData.LowResIconPath ?? CreationData.HighResIconPath;
+        if (iconPath is null) return;
 
         IconDisplayImage = await TryLoadIconBitmapAsync(iconPath);
 
@@ -123,11 +125,12 @@ public class AssetItem : Base.BaseAssetItem
         try
         {
             var texture = await UEParse.Provider!.SafeLoadPackageObjectAsync<UTexture2D>(iconPath);
-            using var iconBitmap = texture?.Decode()?.ToSkBitmap();
+            using var iconBitmap = texture?.Decode(maxMipSize: IconDisplayMaxDimension)?.ToSkBitmap();
             if (iconBitmap is null) return null;
 
-            // Grid icons never need full resolution; decoding at display size keeps hundreds
-            // of realized icons from holding megabytes each.
+            // Grid icons never need full resolution; reading the 256px mip (and downscaling a texture
+            // without one) keeps hundreds of realized icons from holding megabytes each. Upstream reads
+            // the 128px mip, which goes soft on a Retina screen once the tiles are zoomed past 1x.
             using var scaled = DownscaleToFit(iconBitmap, IconDisplayMaxDimension);
             return (scaled ?? iconBitmap).ToWriteableBitmap();
         }

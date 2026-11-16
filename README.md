@@ -27,7 +27,7 @@ It runs beside [FortnitePorting Mac](https://github.com/skythumbnails/FortnitePo
 ## Requirements
 
 - An Apple Silicon Mac, macOS 11 or later
-- Blender 5.x for live import (tested on 5.1.1)
+- Blender 5.x for live import (tested on 5.1.1; exact materials need 5.0 or newer)
 - Optional: VLC 3.x in Applications, for the cosmetic video previews
 - Optional: `brew install vgmstream`, for sound export
 
@@ -38,28 +38,27 @@ The app is not notarized by Apple, so macOS may warn the first time you open it.
 
 ## What's different on Mac
 
-- **Exact materials work in On-Demand mode — no UEFN install needed.** The editor data the fork translates
-  materials from ships in Fortnite's optional `.o.utoc` containers, and On-Demand mode used to skip every one of them
-  (`HybridFileProvider` read `pakchunk0-WindowsClient.o.utoc` as an `o.utoc` file).
-- **Effects replay on Blender 5.1.** The fork's effect replay used a Blender 5.2-only API, so on 5.1 every effect
-  stayed where it was imported, at the character's feet.
+- **Effects replay on Blender 5.1.** The fork's effect replay, cloth replay, freeze and offset use a Blender
+  5.2-only API (`NodesModifier.properties`); on 5.1 they go through the modifier's ID properties instead.
 - The FortnitePorting Mac patch set: native Oodle, macOS window chrome and file drag, `afplay`/`vgmstream` audio,
   the Forge V4 material option.
 - Video previews use VLC.app when it is installed. The fork's updater is off (its releases are Windows builds).
 
-## mp.85 Mac update
+## fpv-4.3.6/mpv-1.13.20 Mac update
 
-Includes upstream mp.85: character dynamics (hair, necklaces and earrings from physics assets, Chaos cloth on
-coats, skirts and capes, wind), Fortnite's official body rig, Control Rig and deform correctives, the MetaHuman and
-flipbook face boards, the rig kit for vehicles, creatures and LEGO figures, effect filters by the item they belong
-to, subsurface base and profile colour, landscape detail and a map actor name filter.
+Includes upstream Material Porter 1.13.20, now merged with FortnitePorting 4.3.6: version numbers like
+`fpv-4.3.6/mpv-1.13.20`, no FortnitePorting account (sign-in, chat and updater off), the Face Board setting, the LEGO
+face and Tasty Rig fixes, and animation filters by gender, body type and use.
 
-Mac changes carried forward from mp.13: icons listed by path, lock-free archive lookups, fast lossless PNG export,
-ReadyToRun, throttled loading status and the bounded launcher probe. The Blender 5.1 fallback for effect replay now
-covers the new cloth replay too, and the new effect filters read each item's saved path instead of reloading it.
+The FortnitePorting Mac patch set is now the one from FortnitePorting Mac 4.3.7 (same CUE4Parse as upstream 4.3.7):
+native Oodle as its own loading stage, lock-free file lookups, the window chrome, audio, file drag and Forge V4.
+Icons by path, random-access archives, fast PNG and the usmap v5 reader are upstream now, so their Mac copies are gone.
 
-The Mac theme, Forge V4 integration, separate Blender plugin, audio fixes and optional editor material data remain
-included.
+Mac changes in this port:
+- Items listed without being read (the Effects and Animations tabs) keep their outline in memory: the filters,
+  names and descriptions read it, and nothing re-reads a whole Niagara system. Other items are still released after
+  listing, and the LEGO filters read their saved class and name.
+- Freezing an effect on a frame and shifting its replay work on Blender 5.1 (both used a Blender 5.2-only API).
 
 ## Known Issues
 
@@ -100,20 +99,11 @@ the submodule, publishes for `osx-arm64`, and writes the app and the dmg to `mac
 > Rocket Racing content. Download it from [Releases](../../releases/latest); what it changes is in [FORK.md](FORK.md).
 > FortnitePorting's Discord and repository don't support it.
 
-## Features
-
-- **Browse Fortnite assets** - Explore cosmetics, props, gameplay items, and more through a purpose-built interface.
-- **Export directly to creative tools** - Send assets to Blender or Unreal Engine through companion plugins managed inside the app.
-- **Work with complete environments** - Export maps, actors, landscapes, foliage, and more.
-- **Choose your workflow** - Use an installed copy of Fortnite or load assets through On-Demand mode.
-- **Preview before exporting** - Inspect models, materials, textures, audio, and raw file properties.
-- **Automate the setup** - Fetch required AES keys and mappings automatically, with configurable export settings.
-
 ## Requirements
 
 - Windows x64
-- A local Fortnite installation or On-Demand mode
-- [Blender 5.0+](https://www.blender.org/download/) and/or [Unreal Engine 5.8+](https://www.unrealengine.com/en-US/download) for live import
+- A local Fortnite installation or wifi strong enough for On-Demand mode
+- [Blender 4.2+](https://www.blender.org/download/) and/or [Unreal Engine 5.8+](https://www.unrealengine.com/en-US/download) for live import
 
 Blender and Unreal Engine are only required when exporting directly to those applications. Assets can also be exported to a folder.
 

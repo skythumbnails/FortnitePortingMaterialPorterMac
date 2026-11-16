@@ -49,6 +49,7 @@ internal static class Program
         try
         {
             _programMutex = new Mutex(true, MaterialPorter.Fork.InstanceMutex, out var isNew);
+            isNew = isNew || MaterialPorter.Fork.WaitAfterRestart(_programMutex, args);     // MP
 
             if (isNew)
             {
@@ -84,7 +85,7 @@ internal static class Program
                 pipe.WaitForConnection();
 
                 var url = reader.ReadString();
-                App.HandleUrlScheme(url);
+                if (!MaterialPorter.Fork.HandlePipe(url)) App.HandleUrlScheme(url);     // MP
                 
                 pipe.Disconnect();
             }
@@ -101,7 +102,7 @@ internal static class Program
             pipe.Connect(1000);
 
             var writer = new BinaryWriter(pipe);
-            writer.Write(args[0]);
+            writer.Write(MaterialPorter.Fork.PipeMessage(args));     // MP: a plain second launch shows the running app
         }
         catch (Exception e)
         {
@@ -124,5 +125,6 @@ internal static class Program
                     AvaloniaNativeRenderingMode.Software
                 }
             })
-            .LogToTrace();
+            .LogToTrace()
+            .With(new Win32PlatformOptions { CompositionMode = MaterialPorter.Fork.CompositionModes });     // MP
 }

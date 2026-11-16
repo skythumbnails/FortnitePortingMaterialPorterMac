@@ -4,7 +4,9 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
+using CUE4Parse.UE4.AssetRegistry.Objects;
 using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Objects.Core.i18N;
 using CUE4Parse.UE4.Objects.UObject;
@@ -58,7 +60,7 @@ public static class EffectOwners
 
     /// <summary>The items' index, kept in a file per build: a later listing reads only the items added since
     /// (on-demand content and hotfixes add some), not every cosmetic and weapon again.</summary>
-    public static async Task Build(string file, string build)
+    public static async Task Build(string file, string build, Action<int, int>? progress = null)
     {
         _byPackage.Clear();
         var items = UEParse.AssetRegistry.Select(a => (Data: a, Source: Sources.FirstOrDefault(s => s.Classes.Contains(a.AssetClass.Text))))
@@ -67,8 +69,21 @@ public static class EffectOwners
         var known = Recall(file, key);
         var fresh = known is null ? items : items.Where(x => !known.Contains(x.Data.ObjectPath)).ToList();
         if (fresh.Count == 0) return;
+        // kept a thousand at a time: a rebuild cut short (the app closed) goes on from there next time
+        var done = 0;
+        foreach (var batch in fresh.Chunk(1000))
+        {
+            var found = await Read(batch, () => progress?.Invoke(Interlocked.Increment(ref done), fresh.Count));
+            foreach (var (package, owner) in found) Own(package, owner);
+            Save(file, key, batch.Select(x => x.Data.ObjectPath), found, append: known is not null || done > batch.Length);
+        }
+        Serilog.Log.Information("[Material Porter] effect owners: {Count} item(s) read", fresh.Count);
+    }
+
+    private static async Task<List<(string Package, Owner Owner)>> Read(IEnumerable<(FPartialAssetData Data, (string[] Classes, EExportType Type, string Kind) Source)> items, Action read)
+    {
         var found = new ConcurrentBag<(string Package, Owner Owner)>();
-        await Parallel.ForEachAsync(fresh, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(2, Environment.ProcessorCount / 2) }, async (x, _) =>
+        await Parallel.ForEachAsync(items, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(2, Environment.ProcessorCount / 2) }, async (x, _) =>
         {
             try
             {
@@ -79,7 +94,7 @@ public static class EffectOwners
                 var name = item.GetAnyOrDefault<FText?>("DisplayName", "ItemName")?.Text is { Length: > 0 } shown ? shown : item.Name;
                 // the icon its own tab shows (a pickaxe's can be its weapon's, an outfit's its hero's)
                 var icon = AppServices.AssetLoading.Get(x.Source.Type).LowResIconHandler(item);
-                var owner = new Owner(name, icon?.GetPathName(), x.Source.Kind);
+                var owner = new Owner(name, icon, x.Source.Kind);
                 foreach (var system in systems.OfType<UObject>())
                     found.Add((Package(system.GetPathName()), owner));
             }
@@ -87,10 +102,12 @@ public static class EffectOwners
             {
                 Exporting.MaterialPorter.Failures.Note("effect owners", x.Data.ObjectPath, e);
             }
+            finally
+            {
+                read();
+            }
         });
-        foreach (var (package, owner) in found) Own(package, owner);
-        Serilog.Log.Information("[Material Porter] effect owners: {Count} item(s) read", fresh.Count);
-        Save(file, key, fresh.Select(x => x.Data.ObjectPath), found, append: known is not null);
+        return found.ToList();
     }
 
     // the file: the key, then "item<TAB>path" for each item read (failed ones too: not retried) and
@@ -150,27 +167,20 @@ public static class EffectOwners
     }
 
     /// <summary>A system's item: one, or a few that share it (names joined, first icon); none when many share it.</summary>
-    private static Owner? Of(UObject system) => Of(system.GetPathName());
-
-    private static Owner? Of(string systemPath)
+    private static Owner? Of(UObject system)
     {
-        if (!_byPackage.TryGetValue(Package(systemPath), out var owners) || owners.IsEmpty || owners.Count > SharedMost) return null;
+        if (!_byPackage.TryGetValue(Package(system.GetPathName()), out var owners) || owners.IsEmpty || owners.Count > SharedMost) return null;
         var sorted = owners.Keys.OrderBy(o => o.Name, StringComparer.OrdinalIgnoreCase).ToList();
         return sorted.Count == 1 ? sorted[0]
             : new Owner(string.Join(" / ", sorted.Select(o => o.Name).Distinct()), sorted.FirstOrDefault(o => o.Icon is not null)?.Icon, sorted[0].Kind);
     }
 
-    public static bool Owned(UObject system) => Owned(system.GetPathName());
+    public static bool Owned(UObject system) => Of(system) is not null;
 
-    // (by path too: the tab's filters run on items whose objects were released)
-    public static bool Owned(string systemPath) => Of(systemPath) is not null;
-
-    public static string KindOf(UObject system) => KindOf(system.GetPathName());
-
-    public static string KindOf(string systemPath)
+    public static string KindOf(UObject system)
     {
-        if (Of(systemPath) is { } owner) return owner.Kind;
-        var path = Package(systemPath);
+        if (Of(system) is { } owner) return owner.Kind;
+        var path = Package(system.GetPathName());
         return PathKinds.FirstOrDefault(k => k.Match.IsMatch(path)).Kind ?? "Other";
     }
 

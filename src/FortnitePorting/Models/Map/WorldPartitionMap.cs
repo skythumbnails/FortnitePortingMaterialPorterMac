@@ -63,7 +63,7 @@ public partial class WorldPartitionMap : ObservableObject
     
     private UWorld? _world;
     private ULevel? _level;
-    private ExportDataMeta? _exportMeta;
+    protected ExportDataMeta? _exportMeta;     // MP: protected
 
     public void Detach()
     {
@@ -84,7 +84,7 @@ public partial class WorldPartitionMap : ObservableObject
         MapInfo = info;
     }
 
-    public async Task Load()
+    public virtual async Task Load()     // MP: virtual
     {
         Grids = [];
         
@@ -128,7 +128,7 @@ public partial class WorldPartitionMap : ObservableObject
                         position = bounds.GetCenter();
 
                         // please don't break other maps
-                        if (_drawnPreview) position = SnapCell(position);     // MP: a drawn map's own grid
+                        if (_drawnPreview || SnapCells) position = SnapCell(position);     // MP: a drawn map's own grid
                         else
                         {
                             position.X -= position.X % MapInfo.MinGridDistance;
@@ -257,7 +257,7 @@ public partial class WorldPartitionMap : ObservableObject
     }
     
     [RelayCommand]
-    public async Task Export()
+    public virtual async Task Export()     // MP: virtual
     {
         _exportMeta = AppSettings.ExportSettings.CreateExportMeta(MapVM.ExportLocation);
         IsExporting = true;
@@ -272,13 +272,15 @@ public partial class WorldPartitionMap : ObservableObject
             if (WorldFlagsLights) _exportMeta.WorldFlags |= EWorldFlags.Lights;
             if (WorldFlagsDecals) _exportMeta.WorldFlags |= EWorldFlags.Decals;
             if (WorldFlagsEffects) _exportMeta.WorldFlags |= EWorldFlags.Effects;
+            if (WorldFlagsHidden) _exportMeta.WorldFlags |= EWorldFlags.Hidden;     // MP
             _exportMeta.ActorFilter = string.IsNullOrWhiteSpace(ActorFilter) ? null : ActorFilter.Trim();     // MP
 
             SelectedMaps.ForEach(map => map.Status = EWorldPartitionGridMapStatus.Waiting);
             
-            var exportedProperly = true;
+            var exportedProperly = await ExportCellTerrain();     // MP
             foreach (var map in SelectedMaps.ToArray())
             {
+                if (TerrainOnly) { map.Status = EWorldPartitionGridMapStatus.Finished; continue; }     // MP
                 map.Status = EWorldPartitionGridMapStatus.Exporting;
                 
                 var world = await UEParse.Provider.SafeLoadPackageObjectAsync<UWorld>(map.Path);
@@ -329,7 +331,7 @@ public partial class WorldPartitionMap : ObservableObject
         await Load();
     }
 
-    private async Task ExportLandscapeMaps(EMapTextureExportType exportType)
+    public async Task ExportLandscapeMaps(EMapTextureExportType exportType, bool open = true)     // MP: public, open
     {
         var heightTileInfos = new List<MapTextureTileInfo>();
         var weightmapTileInfos = new Dictionary<string, List<MapTextureTileInfo>>();
@@ -535,7 +537,7 @@ public partial class WorldPartitionMap : ObservableObject
             }
         }
         
-        App.Launch(ExportPath);
+        if (open) App.Launch(ExportPath);     // MP
     }
 
     private string GetExportPath(string name, string folderName = "")

@@ -8,10 +8,10 @@ from .core import (
     LazyInput,
     Loop,
     SpecialInputs,
-    as_attrs,
     section_name,
     socket_name,
 )
+from . import twins
 
 
 class FunctionsMixin:
@@ -27,6 +27,8 @@ class FunctionsMixin:
         except TypeError:
             # an env that only takes the name (names can repeat across folders)
             path = self.env.function(fname)
+        if path:
+            twins.function_path(self, path, mf.get("ObjectPath", ""))
         return (fname, self.graph(path)) if path else None
 
     @staticmethod
@@ -59,7 +61,10 @@ class FunctionsMixin:
         # (Flowmaps_3D takes its noise volume) is inlined into its caller
         takes_texture = any("Texture" in str((x.get("Properties") or {}).get("InputType", ""))
                             for x in fg.inputs.values())
-        if getattr(self.env, "nest_functions", False) and not takes_texture:
+        # a map probe works with the caller's constants (FunctionTree.ue_input): inline, or the shared
+        # group built first under it keeps them (Alastor's face lines read DF 0.5 and covered his head)
+        probing = getattr(self.env, "probe", None) is not None
+        if getattr(self.env, "nest_functions", False) and not takes_texture and not probing:
             return self.call_group(fname, fg, outs, out, ins, (id(x), g.path, scope.get("_id", 0)))
         FunctionsMixin._scope_id[0] += 1
         sub = dict(ins)
@@ -92,25 +97,40 @@ class FunctionsMixin:
                     todo.append(b)
         return False
 
+    @staticmethod
+    def preview_scope(ins, fname, sock, site):
+        """Where an unwired input's preview builds: UE compiles it inside the call, so the function's
+        other inputs it reads are the call's (the anime shader's normal preview reads Normal_Map)."""
+        scope = dict(ins)
+        scope["_id"] = ("preview", fname, sock, site)
+        return scope
+
     def fold_call(self, ft, fg, fo, name, w, ins, site):
         """A call whose output reads only inputs known when built (constants all the way): the
         function worked out inline, a value instead of a group node (a time of day's weights
         broken out of a float4 the file holds no day for). None where it isn't."""
         needs = ft.reached(name) | (ft.reached(socket_name(name + " (A)")) if w == 4 else set())
-        if not needs:
+        # while map textures are probed the env's own inputs (world position, parameters) are constants too, and
+        # so may be an output reading none of the group's inputs (Hera's biome mask UVs: the world, inside it)
+        probing = getattr(self.env, "probe", None) is not None
+        if not needs and not probing:
             return None
         # in the group's input order, not the set's: reading an input builds the caller's nodes
         # (and other calls' outputs) as it goes, and the first non-constant one stops it; a set's
         # order followed PYTHONHASHSEED, and so did the trees
         needs = [s for s in ft.kind if s in needs]
-        if any(ft.kind[s][0] not in ("ue", "ue_alpha") for s in needs):
+        if any(ft.kind[s][0] not in ("ue", "ue_alpha") and not (probing and ft.kind[s][0] == "env") for s in needs):
             return None
-        for sock in needs:
+        for sock in [s for s in needs if ft.kind[s][0] != "env"]:
             kind, key = ft.kind[sock]
             lazy = ins.get(key)
             v = lazy.get(self) if lazy is not None else None
             if v is None and sock in ft.previews:
-                v = self.input(fg, ft.previews[sock], {"_id": ("preview", ft.fname, sock)}, None)
+                # (a probe's own: the build's preview reads the real world position)
+                scope = self.preview_scope(ins, ft.fname, sock, site)
+                if probing:
+                    scope["_id"] += (self.env.probe,)
+                v = self.input(fg, ft.previews[sock], scope, None)
             if v is None or not v.const or (kind == "ue_alpha" and not self.alpha(v).const):
                 return None
         sub = dict(ins)
@@ -131,9 +151,20 @@ class FunctionsMixin:
         fixed = self._hook("function_key", lambda: ())
         key = (fg.path, tuple(sorted(statics.items())), fixed) if statics or fixed else fg.path
         ft = self.functions.get(key)
-        if ft is None:
-            ft = self.functions[key] = FunctionTree(self, fname, fg, statics, self.variant_label(fname, fg, statics))
-            if getattr(self.env, "whole_functions", False):
+        new = ft is None
+        if new:
+            label = self.variant_label(fname, fg, statics)
+            # an earlier material's group this env would build again (twins): no twin to build and share away
+            ft = twins.find(self, key, label)
+            new = ft is None
+            if new:
+                ft = self.functions[key] = FunctionTree(self, fname, fg, statics, label)
+                twins.record(self, ft, key)
+        twins.used(self, key, ft)
+        # the call building its outputs: map textures probed in the body read its inputs (FunctionTree.ue_input)
+        site_was, ft.site = ft.site, (self, ins)
+        try:
+            if new and getattr(self.env, "whole_functions", False):
                 # every output, in the function's own order: two materials calling it build the same
                 # group and share it (built as each asked, their groups differed by what each read:
                 # a copy of the function per material). Unread outputs cost nothing at render:
@@ -142,8 +173,13 @@ class FunctionsMixin:
                     try:
                         ft.output(each)
                     except RuntimeError as e:       # (an output UE would compile on its own: a loop here)
+                        twins.fail(ft)
                         self.warnings.append("%s: output %s left out (%s)" % (fname, (each.get("Properties") or {}).get("OutputName"), e))
-        name, w = ft.output(fo)
+            elif ft.facts is not None and ft.outs.get(fo["Properties"].get("Id")) is None:
+                twins.fail(ft)      # (an output built after the rest: not the group a twin's build makes)
+            name, w = ft.output(fo)
+        finally:
+            ft.site = site_was
         if w != "attrs":
             if name in ft.const_outs:
                 return ft.const_outs[name]
@@ -154,6 +190,8 @@ class FunctionsMixin:
         def fresh():
             n = self.node("ShaderNodeGroup", section_name(fname))
             n.node_tree = ft.tree
+            if ft.reused:
+                twins.own_values(n, ft)
             return n, set()
 
         # One node per call, whichever outputs are read: UE compiles each output on its own, and
@@ -206,13 +244,13 @@ class FunctionsMixin:
                 fid, attr = key
                 lazy = ins.get(fid)
                 v = lazy.get(self) if lazy is not None else None
-                attrs = v.s if v is not None and isinstance(v.s, Attrs) else Attrs()
-                v = attrs.get(attr)
+                # a plain value wired in is every attribute (UE compiles one property at a time)
+                v = Attrs().get(attr) if v is None else self.attribute_value(v, attr)
             elif kind in ("ue", "ue_alpha"):
                 lazy = ins.get(key)
                 v = lazy.get(self) if lazy is not None else None
                 if v is None and sock in ft.previews:
-                    v = self.input(fg, ft.previews[sock], {"_id": ("preview", fname, sock)}, None)
+                    v = self.input(fg, ft.previews[sock], self.preview_scope(ins, fname, sock, site), None)
                 if v is not None and kind == "ue_alpha":
                     v = self.alpha(v)
                 elif kind == "ue":
@@ -241,8 +279,9 @@ class FunctionsMixin:
                     def own(fid=o[1], a=a):
                         if fid not in passed:
                             lazy = ins.get(fid)
-                            passed[fid] = as_attrs(lazy.get(self) if lazy is not None else None)
-                        return passed[fid].get(a)
+                            passed[fid] = lazy.get(self) if lazy is not None else None
+                        v = passed[fid]
+                        return Attrs().get(a) if v is None else self.attribute_value(v, a)
                     got.thunks[a] = self.deferred(own)
                 elif o[0] == "const":
                     got.vals[a] = o[1]

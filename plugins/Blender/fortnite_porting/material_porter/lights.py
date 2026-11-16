@@ -129,4 +129,8 @@ class LightImportMixin:
         # the actor it came from; its own meshes won't shadow it (material_porter.shadow_linking)
         if data.get("Actor"):
             light["mp_actor"] = str(data["Actor"])
+        if data.get("MPHidden"):
+            light["mp_hidden"] = 1.0
+        if data.get("MPLayer"):
+            light["mp_layer"] = str(data["MPLayer"])
         return light, light_data

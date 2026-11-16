@@ -17,6 +17,11 @@ def after_import(mesh, obj, mesh_obj, scale, landscape_detail=1):
     if (fx := mesh.get("MPEffect") or {}).get("Kind") == "Mesh":
         from . import effects
         effects.tag_mesh(target, fx)
+    for key, tag in (("MPHidden", "mp_hidden"), ("MPLayer", "mp_layer")):
+        if value := mesh.get(key):
+            for o in (obj, mesh_obj):
+                if o is not None:
+                    o[tag] = 1.0 if value is True else str(value)
     if target is None or target.type != 'MESH':
         return
     if sp := mesh.get("MPSpline"):
@@ -30,7 +35,16 @@ def after_import(mesh, obj, mesh_obj, scale, landscape_detail=1):
         for attribute in target.data.color_attributes:
             if attribute.name in names:
                 attribute.name = names[attribute.name]
+        # three to an attribute (Eevee reads 14 mesh attributes a material at most)
+        from .landscape_layers import order, pack
+        present = [n for n in names.values() if n in target.data.color_attributes]
+        pack(target, present, order(bpy.context.scene, present))
         target["mp_landscape"] = 1.0
+        target["mp_tile"] = mesh.get("Path")
+        if grass := mesh.get("MPGrass"):
+            # its material's grass outputs and their types: the editor's Scatter mode and grass_masks read them
+            import json
+            target["mp_grass"] = json.dumps(grass)
         if landscape_detail > 1:
             from .landscape_detail import reduce
             old = target.data

@@ -15,6 +15,7 @@ using CUE4Parse.UE4.Assets.Objects;
 using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Objects.UObject;
 using CUE4Parse.Utils;
+using FortnitePorting.CUE4Parse.Extensions;
 using FortnitePorting.Exporting.Models;
 using FortnitePorting.Shared.Extensions;
 
@@ -41,13 +42,15 @@ public partial class ExportContext
     public T? Mesh<T>(USkeletalMesh? mesh) where T : ExportMesh, new()
     {
         if (mesh is null) return null;
+        T? owned = null; UefnSkeletalMesh(mesh, ref owned); if (owned != null) return owned;     // MP
+        var mpStarted = System.Diagnostics.Stopwatch.GetTimestamp();     // MP
 
         try
         {
             if (FileExportOptions.ExportMorphTargets)
                 mesh.PopulateMorphTargetVerticesData();
 
-            using var convertedMesh = new SkeletalMeshDto(mesh, FileExportOptions.MeshQuality, FileExportOptions.NaniteMeshFormat);
+            using var convertedMesh = SkeletalDto(mesh);     // MP
             if (convertedMesh.LODs.Count <= 0) return null;
 
             var files = CreateMeshFormat().BuildSkeletalMesh(mesh.Name, mesh.GetPathName(), FileExportOptions, convertedMesh);
@@ -57,8 +60,10 @@ public partial class ExportContext
                 Path = ExportMeshFiles(mesh, files),
                 NumLods = LodCount(convertedMesh)
             };
+            MPTrace.Mesh(mesh, mpStarted);     // MP
 
             AddMeshMaterials(exportPart, convertedMesh);
+            HideDisabledSections(exportPart, mesh, convertedMesh); // MP
             if (EffectsPick) MeshSockets(exportPart, mesh); // MP
             return exportPart;
         }
@@ -68,7 +73,7 @@ public partial class ExportContext
             return null;
         }
     }
-    
+
     public ExportMesh? Mesh(UStaticMesh? mesh)
     {
         return Mesh<ExportMesh>(mesh);
@@ -77,10 +82,12 @@ public partial class ExportContext
     public T? Mesh<T>(UStaticMesh? mesh) where T : ExportMesh, new()
     {
         if (mesh is null) return null;
+        T? owned = null; UefnStaticMesh(mesh, ref owned); if (owned != null) return owned;     // MP
+        var mpStarted = System.Diagnostics.Stopwatch.GetTimestamp();     // MP
 
         try
         {
-            using var convertedMesh = new StaticMeshDto(mesh, FileExportOptions.MeshQuality, FileExportOptions.NaniteMeshFormat);
+            using var convertedMesh = new StaticMeshDto(mesh, FileExportOptions);
             if (convertedMesh.LODs.Count <= 0) return null;
 
             var files = CreateMeshFormat().BuildStaticMesh(mesh.Name, mesh.GetPathName(), FileExportOptions, convertedMesh);
@@ -90,6 +97,7 @@ public partial class ExportContext
                 Path = ExportMeshFiles(mesh, files, embeddedAsset: mesh.Owner?.Name.SubstringAfterLast("/") != mesh.Name),
                 NumLods = LodCount(convertedMesh)
             };
+            MPTrace.Mesh(mesh, mpStarted);     // MP
 
             AddMeshMaterials(exportPart, convertedMesh);
             if (EffectsPick) MeshSockets(exportPart, mesh); // MP
@@ -130,8 +138,9 @@ public partial class ExportContext
     
     public ExportMesh? MeshComponent(USkeletalMeshComponent meshComponent)
     {
-        var mesh = meshComponent.GetSkeletalMesh().Load<USkeletalMesh>();
-        if (mesh is null) return null;
+        meshComponent.GatherTemplateProperties();
+        
+        if (meshComponent.GetSkeletalMesh().LoadOrDefault<USkeletalMesh>() is not { } mesh) return null;
 
         var exportMesh = Mesh(mesh);
         if (exportMesh is null) return null;
@@ -152,8 +161,8 @@ public partial class ExportContext
     
     public ExportMesh? MeshComponent(UStaticMeshComponent meshComponent)
     {
-        var mesh = meshComponent.GetStaticMesh().Load<UStaticMesh>();
-        if (mesh is null) return null;
+        meshComponent.GatherTemplateProperties();
+        if (meshComponent.GetStaticMesh().LoadOrDefault<UStaticMesh>() is not { } mesh) return null;
 
         var exportMesh = meshComponent is USplineMeshComponent splineComp ? MeshComponent(splineComp) : Mesh(mesh);
         if (exportMesh is null) return null;
@@ -201,10 +210,11 @@ public partial class ExportContext
     public T? MeshComponent<T>(USplineMeshComponent? mesh) where T : ExportMesh, new()
     {
         if (mesh is null) return null;
+        var mpStarted = System.Diagnostics.Stopwatch.GetTimestamp();     // MP
 
         try
         {
-            using var convertedMesh = new StaticMeshDto(mesh, FileExportOptions.MeshQuality);
+            using var convertedMesh = new StaticMeshDto(mesh, FileExportOptions);
             if (convertedMesh.LODs.Count <= 0) return null;
 
             var files = CreateMeshFormat().BuildStaticMesh(mesh.Name, mesh.GetPathName(), FileExportOptions, convertedMesh);
@@ -214,6 +224,7 @@ public partial class ExportContext
                 Path = ExportMeshFiles(mesh, files, embeddedAsset: true),
                 NumLods = LodCount(convertedMesh)
             };
+            MPTrace.Mesh(mesh, mpStarted);     // MP
 
             AddMeshMaterials(exportPart, convertedMesh);
             if (EffectsPick) MeshSockets(exportPart, mesh); // MP

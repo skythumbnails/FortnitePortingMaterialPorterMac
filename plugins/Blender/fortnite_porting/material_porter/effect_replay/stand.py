@@ -43,6 +43,7 @@ def store(root, exports, fields, scale, sockets=None):
     text.write("\n".join(packed[i:i + 4000] for i in range(0, len(packed), 4000)))
     root[KEY_PROGRAM] = text.name
     root[KEY_SCALE] = float(scale)
+    hold(root)
 
 
 def program(root):
@@ -85,6 +86,55 @@ def attach(root, rig):
     root.matrix_parent_inverse.identity()
     root.location = (0.0, 0.0, 0.0)
     root.rotation_euler = (0.0, 0.0, 0.0)
+    hold(root)
+
+
+# holder's session uid -> {effect's session uid: its name when last seen}. Uids survive renames and undo, not a
+# file's reopening: note_holders notes them again then.
+_HELD = {}
+
+
+def hold(root):
+    """Note the effect on every object above it, so the side panel finds it from a holder without walking the scene."""
+    at = root.parent
+    while at is not None:
+        _HELD.setdefault(at.session_uid, {})[root.session_uid] = root.name
+        at = at.parent
+
+
+def _object(uid, name):
+    found = bpy.data.objects.get(name)
+    if found is not None and found.session_uid == uid:
+        return found
+    return next((o for o in bpy.data.objects if o.session_uid == uid), None)        # renamed since: one pass
+
+
+def held(obj):
+    """The replayable effects noted on the object that are still under it."""
+    noted = _HELD.get(obj.session_uid) if obj is not None else None
+    found = []
+    for uid, name in list((noted or {}).items()):
+        root = _object(uid, name)
+        if root is None:
+            del noted[uid]
+            continue
+        noted[uid] = root.name
+        if root.get(effects.KEY) != "System" or not root.get(KEY_PROGRAM):
+            continue
+        at = root.parent
+        while at is not None and at != obj:
+            at = at.parent
+        if at is not None:
+            found.append(root)
+    return found
+
+
+def note_holders():
+    """Note every effect's holders afresh (one pass over the file's objects), as a file opens."""
+    _HELD.clear()
+    for obj in bpy.data.objects:
+        if obj.parent is not None and obj.get(effects.KEY) == "System" and obj.get(KEY_PROGRAM):
+            hold(obj)
 
 
 def rig_of(root):
@@ -268,3 +318,32 @@ def _variable(system, name):
 
 DEPTH_BIAS = ("Metres the particles are drawn nearer the camera, along their view rays (they look the same). "
               "Under Cycles, a renderer drawn after others: UE and EEVEE draw blended layers in order, Cycles by depth")
+
+
+class _IdPropertyInput:
+    """A node modifier's input on Blender before 5.2 (no NodesModifier.properties): its ID property, shaped like the socket."""
+
+    def __init__(self, modifier, identifier):
+        self._modifier, self._path = modifier, '["%s"]' % identifier
+        self._identifier = identifier
+
+    @property
+    def value(self):
+        return self._modifier[self._identifier]
+
+    @value.setter
+    def value(self, value):
+        self._modifier[self._identifier] = value
+
+    def driver_add(self, _path="value"):
+        return self._modifier.driver_add(self._path)
+
+    def driver_remove(self, _path="value"):
+        return self._modifier.driver_remove(self._path)
+
+
+def input_socket(modifier, identifier):
+    """A node modifier's input, through the API the running Blender has."""
+    if hasattr(modifier, "properties"):
+        return getattr(modifier.properties.inputs, identifier)
+    return _IdPropertyInput(modifier, identifier)

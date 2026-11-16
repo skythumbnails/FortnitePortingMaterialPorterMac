@@ -118,6 +118,8 @@ public partial class MapViewModel(
                 Maps.Add(new WorldPartitionMap(mapInfo));
             }
 
+            await AddGameMapsAsync();     // MP
+
             foreach (var mapInfo in _settings.Application.LocalMapInfos.ToArray())
             {
                 if (!mapInfo.IsValid())
@@ -152,7 +154,9 @@ public partial class MapViewModel(
                     Maps.Add(new WorldPartitionMap(mapInfo));
                 }
             }
-            
+
+            AddProjectMaps();     // MP
+
             if (Maps.Count == 0)
             {
                 _info.Message("No Supported Maps", "Failed to find any supported maps for processing.");

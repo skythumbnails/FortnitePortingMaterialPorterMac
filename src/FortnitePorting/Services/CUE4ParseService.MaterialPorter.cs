@@ -19,6 +19,9 @@ public partial class CUE4ParseService
 {
     private InstallationProfile Profile => AppSettings.Installation.CurrentProfile;
 
+    // Local UEFN projects' files, added before the plugin mounts are read.
+    partial void RegisterProjectFiles();
+
     private void OnLoadingStarted()
     {
         MaterialPorter.MaterialPorterService.Instance.OnGameLoading();

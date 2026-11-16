@@ -85,7 +85,8 @@ public partial class MaterialPorterService : IService
             // Unreal Editor for Fortnite has (about 5 GB of editor data in the Paks). Warn once instead of approximating silently.
             _ = Task.Run(() =>
             {
-                if (provider.Files.Keys.Any(k => k.EndsWith(".o.uasset", StringComparison.OrdinalIgnoreCase))) return;
+                // CUE4Parse merges them into the cooked packages now: they show as optional segments, no longer as files
+                if (provider.Files.OptionalById.Count > 0 || provider.Files.Keys.Any(k => k.EndsWith(".o.uasset", StringComparison.OrdinalIgnoreCase))) return;
                 Log.Warning("[Material Porter] no editor graphs in this install: materials are approximated (install Unreal Editor for Fortnite)");
                 // a build downloaded from its manifest gets them from its UEFN manifest instead
                 var downloaded = AppServices.AppSettings.Installation.CurrentProfile.IsCustomOnDemand;
@@ -107,7 +108,7 @@ public partial class MaterialPorterService : IService
 
     // ------------------------------------------------------------ islands
     /// <summary>Passes the user's UEFN project folders (Settings > Application) to the core, which reads island master graphs from the matching project.</summary>
-    // Owner builds only; the core also takes MATERIAL_PORTER_PROJECTS regardless of the settings.
+    // With UEFN access only; the core also takes MATERIAL_PORTER_PROJECTS regardless of the settings.
     public static void ApplyProjectFolders() =>
         IslandProjects.Roots = Fork.Islands
             ? AppSettings.Application.UefnProjectFolders.Concat(DetectedProjectRoots()).Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
@@ -316,10 +317,11 @@ public partial class MaterialPorterService : IService
     {
         // what this build does: the Material Fixer shows island recovery only where islands are
         if (route == "fork-caps") return new { islands = Fork.Islands };
+        if (EditorRoute(route, query) is { } editor) return await editor;
         if (route.StartsWith("fork-island-"))
         {
-            // the Material Fixer's island texture recovery (IslandMaterials): owner builds only
-            if (!Fork.Islands) throw new InvalidOperationException("island texture recovery is only in the owner's builds");
+            // the Material Fixer's island texture recovery (IslandMaterials)
+            if (!Fork.Islands) throw new InvalidOperationException("island texture recovery needs UEFN access");
             var asked = query["path"] ?? throw new ArgumentException("path missing");
             return route switch
             {

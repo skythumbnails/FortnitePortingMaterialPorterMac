@@ -213,6 +213,29 @@ still_arm = armature("still")
 key_arm(still_arm, [(0, 0.0), (20, 0.0)])
 store(still_arm, tag_node(gravity_override=[0.0, 0.0, 0.0]))
 check("a still pose bakes one bone over its frames", db.bake(still_arm), (1, 21))
+
+
+class AnyLayout:
+    """A layout that takes every call (the panel's draw code, without a window)."""
+    def __getattr__(self, name):
+        return lambda *a, **k: AnyLayout()
+
+    def __setattr__(self, name, value):
+        pass
+
+
+# the panel redraws on every mouse move and playback frame: it reads the stored nodes once, not on each draw
+# (parsing a character's took 25 ms, three times per draw)
+parsed, real_loads = [0], db.json.loads
+db.json.loads = lambda *a, **k: (parsed.__setitem__(0, parsed[0] + 1), real_loads(*a, **k))[1]
+try:
+    for _ in range(5):
+        db.ui(AnyLayout(), still_arm)
+finally:
+    db.json.loads = real_loads
+check("five panel draws parse the stored nodes at most once", parsed[0] <= 1, True)
+store(still_arm, tag_node(gravity_override=[0.0, 0.0, -980.0]))
+check("and again after they change", db.states(still_arm) is not None and db._cloth(still_arm) == [], True)
 track = db._track(still_arm)
 check("one Dynamics strip", (track is not None, len(track.strips) if track else 0), (True, 1))
 action = track.strips[0].action
@@ -601,6 +624,22 @@ store(rigged, {"kind": "control_rig", "program": rig_program, "alpha": 1.0, "var
       tag_node(gravity_override=[0.0, 0.0, 0.0], ang_spring=5000.0))
 run = Runner(rigged)
 check("the rig hands on nothing it doesn't share with a simulation", [s.outputs() for s in run.sims if hasattr(s, "machine")], [[]])
+
+# but a character's own helper bone the rig turns (QuaintToy's skirt bases, aimed from the thighs) reaches Blender:
+# nothing else drives it, and the mesh is weighted to it
+helped = armature("helped")
+bpy.context.view_layer.objects.active = helped
+bpy.ops.object.mode_set(mode='EDIT')
+base = helped.data.edit_bones.new("base_bow")
+base.head, base.tail, base.parent = (0.2, 0, 1), (0.2, 0, 0.9), helped.data.edit_bones["upperarm"]
+bpy.ops.object.mode_set(mode='OBJECT')
+helper_program = json.loads(json.dumps(rig_program))
+helper_program["literals"]["0"] = [{"Item": {"Name": "upperarm"}, "Transform": turn_upper}, {"Item": {"Name": "base_bow"}, "Transform": turn_upper}]
+helper_program["bones"], helper_program["writes"] = ["upperarm", "base_bow"], ["upperarm", "base_bow"]
+store(helped, {"kind": "control_rig", "program": helper_program, "alpha": 1.0, "variables": {}},
+      tag_node(gravity_override=[0.0, 0.0, 0.0], ang_spring=5000.0))
+check("a rig hands on the character's own helper bones, not the body's", [s.outputs() for s in Runner(helped).sims if hasattr(s, "machine")],
+      [["base_bow"]])
 pose_in = run.sample()
 cs_out = run.tick(pose_in)
 loc_t, q_t = run.basis(cs_out, "dyn_tag")
@@ -609,6 +648,31 @@ want_world = run_world = None
 from fpmp_baseline.processing.context.dynamics_runner import from_game  # noqa: E402
 want_world = from_game(cs_out["dyn_tag"], run.inv["dyn_tag"], run.unit)
 check("a twin under a rig-turned parent keeps the turn", round((twin_world.to_quaternion().rotation_difference(want_world.to_quaternion())).angle, 4), 0.0)
+# ...but only in its own part (user report: Riku's hair bent sideways): each part's anim blueprint runs on its own copy of
+# the pose, so a rig in the body turning a bone it doesn't hand on (Riku's body rig turns the head 40 degrees) never
+# reaches another part's simulation
+apart = armature("apart")
+store(apart, {"kind": "control_rig", "program": rig_program, "alpha": 1.0, "variables": {}, "part": 0},
+      dict(tag_node(gravity_override=[0.0, 0.0, 0.0], ang_spring=5000.0), part=1))
+alone = armature("alone")
+store(alone, dict(tag_node(gravity_override=[0.0, 0.0, 0.0], ang_spring=5000.0), part=1))
+run_apart, run_alone = Runner(apart), Runner(alone)
+got, want = run_apart.tick(run_apart.sample())["dyn_tag"], run_alone.tick(run_alone.sample())["dyn_tag"]
+check("another part's rig doesn't turn this part's simulation", round(got[0].rotation_difference(want[0]).angle, 4), 0.0)
+# ...while a part's own rig moving the root its chain hangs from reaches the final pose (VagueHex's hair rig keeps the
+# hair roots off the back: held back, the chains swung into the body)
+idle_program = dict(json.loads(json.dumps(rig_program)), writes=[], bones=[])
+idle_program["literals"]["0"] = []
+own = armature("own")
+store(own, {"kind": "control_rig", "program": idle_program, "alpha": 1.0, "variables": {}, "part": 0},
+      {"kind": "control_rig", "program": rig_program, "alpha": 1.0, "variables": {}, "part": 1},
+      dict(tag_node(gravity_override=[0.0, 0.0, 0.0], ang_spring=5000.0), part=1))
+whole = armature("whole")
+store(whole, {"kind": "control_rig", "program": rig_program, "alpha": 1.0, "variables": {}, "part": 1},
+      dict(tag_node(gravity_override=[0.0, 0.0, 0.0], ang_spring=5000.0), part=1))
+run_own, run_whole = Runner(own), Runner(whole)
+got, want = run_own.tick(run_own.sample())["dyn_tag"], run_whole.tick(run_whole.sample())["dyn_tag"]
+check("a part's own rig turning its chain's root reaches the final pose", round(got[0].rotation_difference(want[0]).angle, 4), 0.0)
 
 # a switch fed by a variable picks its side per movement state; nodes off in a state get alpha 0 there
 switch_dump = [dict(dump[0], ChildProperties=[{"Name": n} for n in ("AnimGraphNode_CopyPoseFromMesh", "AnimGraphNode_AnimDynamics",
@@ -679,6 +743,27 @@ scene.frame_set(0)
 baked0 = moving.pose.bones["dyn_tag"].matrix.to_quaternion()
 check("the bake's first frame matches its own simulation",
       round(math.degrees(baked0.rotation_difference(from_game(first["dyn_tag"], fresh.inv["dyn_tag"], fresh.unit).to_quaternion()).angle), 1), 0.0, 0.5)
+
+# the warm-up starts at the rest pose and moves into the first frame, as the game's idle does: a clip starting
+# mid-stride would hand the bodies its overlaps as starting ones, which they may keep (QuaintToy's skirt let the legs through)
+db.set_on(moving, False)
+scene.frame_set(10)
+warm = Runner(moving)
+mid = warm.sample()
+moving.data.pose_position = 'REST'
+bpy.context.view_layer.update()
+at_rest = warm.sample()
+moving.data.pose_position = 'POSE'
+bpy.context.view_layer.update()
+fed, real_tick = [], Runner.tick
+Runner.tick = lambda self, loc: (fed.append(loc), real_tick(self, loc))[1]
+try:
+    warm.start(mid)
+finally:
+    Runner.tick = real_tick
+db.set_on(moving, True)
+check("the warm-up starts at the rest pose", round(math.degrees(fed[0]["upperarm"][0].rotation_difference(at_rest["upperarm"][0]).angle), 3), 0.0)
+check("and ends on the first frame", round(math.degrees(fed[-1]["upperarm"][0].rotation_difference(mid["upperarm"][0]).angle), 3), 0.0)
 
 # each node's alpha is its own: a later switched-off control on the same bone doesn't switch off the simulation
 shared = armature("shared")

@@ -53,7 +53,6 @@ public partial class FilesService : ObservableObject, IService, IResettable
         var totalFiles = UEParse.Provider.Files.Count;
         TaskService.RunDispatcher(() => TotalFiles = totalFiles);
 
-        var flatItems = new List<FlatItem>(totalFiles);
         var processed = 0;
         var lastReported = 0;
 
@@ -68,31 +67,8 @@ public partial class FilesService : ObservableObject, IService, IResettable
                 if (file is VfsEntry vfsEntry)
                     sourceVfsName = vfsEntry.Vfs.Name;
 
-                flatItems.Add(new FlatItem(path, sourceVfsName));
-
-                var parts = path.Split("/", StringSplitOptions.RemoveEmptyEntries);
-
-                var parentNode = RootFileNode;
-                RootFileNode.AddVfsName(sourceVfsName);
-                for (var i = 0; i < parts.Length; i++)
-                {
-                    var part = parts[i];
-                    if (!parentNode.TryGetChild(part, out var childNode))
-                    {
-                        var isFile = i == parts.Length - 1;
-                        var nodePath = isFile
-                            ? path
-                            : string.Concat(path.AsSpan(0, path.IndexOf(part, StringComparison.Ordinal)), part);
-                        childNode = new FileNode(part, nodePath, isFile ? ENodeType.File : ENodeType.Folder, sourceVfsName);
-                        parentNode.AddChild(part, childNode);
-                    }
-                    else
-                    {
-                        childNode.AddVfsName(sourceVfsName);
-                    }
-
-                    parentNode = childNode;
-                }
+                // MP: the flat view's items are made when it is first shown (EnsureFlatView)
+                AddToTree(path, sourceVfsName);     // MP
             }
 
             if (processed - lastReported >= ProgressBatchSize || processed == totalFiles)
@@ -102,13 +78,11 @@ public partial class FilesService : ObservableObject, IService, IResettable
                 TaskService.RunDispatcher(() => LoadedFiles = report);
             }
         }
-
-        FlatViewAssetCache.Edit(updater => updater.AddOrUpdate(flatItems));
     }
 
     private bool IsValidFilePath(string path)
     {
-        var isValidExtension = path.EndsWith(".uasset") || path.EndsWith(".umap") || path.EndsWith(".ufont");
+        var isValidExtension = path.EndsWith(".uasset", StringComparison.Ordinal) || path.EndsWith(".umap", StringComparison.Ordinal) || path.EndsWith(".ufont", StringComparison.Ordinal);     // MP: ordinal (culture compares were seconds over 4 M files)
         var isVerse = path.Contains("/_Verse/");
         return isValidExtension && !isVerse;
     }

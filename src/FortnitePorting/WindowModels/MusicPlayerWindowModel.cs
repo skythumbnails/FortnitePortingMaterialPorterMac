@@ -227,7 +227,7 @@ public partial class MusicPlayerWindowModel(
         StartAfPlay(_currentWavPath);
         _resumeUtc = DateTime.UtcNow;
         IsPlaying = true;
-        ActiveItem?.IsPlaying = true;
+        ActiveItem.IsPlaying = true;
     }
 
     public void Scrub(TimeSpan time) { /* afplay does not support seeking */ }

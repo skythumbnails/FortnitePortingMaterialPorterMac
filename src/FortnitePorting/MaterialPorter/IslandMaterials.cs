@@ -10,13 +10,14 @@ using CUE4Parse.UE4.Assets.Exports.StaticMesh;
 using CUE4Parse.UE4.Assets.Exports.Texture;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using FortnitePorting.CUE4Parse.Extensions;
 
 namespace FortnitePorting.MaterialPorter;
 
 /// <summary>UEFN island materials that an FP import brought in without textures, for the Blender plugin's Material Fixer.</summary>
 // FP exports only texture parameters, but island masters hard-code textures (listed only in the cooked
 // UMaterial's ReferencedTextures) or use plain colours (cooked defaults in CachedExpressionData).
-// Port of the fpisland tool; reads what the app has mounted (owner builds only).
+// Port of the fpisland tool; reads what the app has mounted (with UEFN access).
 public static class IslandMaterials
 {
     private static readonly Regex Island = new(@"(^|/)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/", RegexOptions.IgnoreCase);
@@ -88,14 +89,14 @@ public static class IslandMaterials
             }
             if (cur is UMaterialInstance mi)
             {
-                cur = mi.Parent;
+                cur = mi.Parent?.LoadOrDefault<UUnrealMaterial>();
                 continue;
             }
             if (cur is UMaterial um)
             {
                 // the provider skips the ReferencedTextures import scan (FP setting), so scan here
                 var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var tex in um.ReferencedTextures.Concat(MaterialService.ImportedTextures(um)))
+                foreach (var tex in um.ReferencedTextures.Select(i => i?.LoadOrDefault<UTexture>()).Concat(MaterialService.ImportedTextures(um)))
                     if (tex is not null && seen.Add(tex.GetPathName())) Texture(tex, "(referenced)", um.Name);
                 // master parameter defaults: names of each runtime parameter type beside their values
                 if (um.CachedExpressionData is { } ced && JToken.Parse(JsonConvert.SerializeObject(ced, Ser)) is JObject ce)

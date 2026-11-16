@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Runtime;
 using System.Threading;
 using System.Threading.Tasks;
+using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Threading;
 using Avalonia.Input.Platform;
@@ -67,6 +68,7 @@ public class AppService : IService
         Lifetime.Exit += OnAppExit;
         Lifetime.MainWindow = new AppWindow();
         MaterialPorter.Fork.Quiet(Lifetime.MainWindow);     // MP
+        MaterialPorter.Fork.Start(Lifetime.MainWindow, Lifetime.Args ?? []);     // MP: the editor's engine
     }
     
     
@@ -204,6 +206,11 @@ public class AppService : IService
         {
             AppSettings.Installation.Profiles.FirstOrDefault()?.IsSelected = true;
         }
+
+        if (AppSettings.Plugin.Blender.DefaultInstallation is null && AppSettings.Plugin.Blender.Installations.Count > 0)
+        {
+            AppSettings.Plugin.Blender.Installations[0].IsDefault = true;
+        }
         
         // MP: the automatic sync waits for the plugin files DependencyService writes in the background
         if (AppSettings.Plugin.Blender.AutomaticallySync)
@@ -273,9 +280,49 @@ public class AppService : IService
 
     public void Launch(string location, bool shellExecute = true)
     {
+        // macOS: an app's own binary (Blender.app/Contents/MacOS/Blender) started directly runs as our child process
+        // and borrows our privacy permissions; LaunchServices opens the .app on its own, the way the Dock does
+        if (OperatingSystem.IsMacOS() && location.IndexOf(".app/Contents/MacOS/", StringComparison.OrdinalIgnoreCase) is var bundleEnd and >= 0)
+        {
+            Process.Start("open", [location[..(bundleEnd + ".app".Length)]]);
+            return;
+        }
+
         Process.Start(new ProcessStartInfo { FileName = location, UseShellExecute = shellExecute });
     }
 
+    public void SetMainWindowTopmost(bool topmost, bool applyImmediately = false)
+    {
+        var setTopmost = () => {
+            if (Lifetime.MainWindow is not { } window)
+                return;
+
+            window.Topmost = topmost;
+            if (topmost)
+                window.Activate();
+        };
+        
+        if (applyImmediately)
+            Dispatcher.UIThread.Invoke(setTopmost);
+        else
+            Dispatcher.UIThread.Post(setTopmost);
+    }
+
+    public void RefocusMainWindow()
+    {
+        var refocus = () => {
+            if (Lifetime.MainWindow is not { } window)
+                return;
+
+            window.Activate();
+        };
+
+        if (Dispatcher.UIThread.CheckAccess())
+            refocus();
+        else
+            Dispatcher.UIThread.Post(refocus);
+    }
+    
     public void LaunchSelected(string location)
     {
         if (OperatingSystem.IsWindows())
@@ -329,7 +376,7 @@ public class AppService : IService
     
     public void Restart()
     {
-        Launch(AppDomain.CurrentDomain.FriendlyName, false);
+        MaterialPorter.Fork.Restart();     // MP: this exe; by name it could start another FP, or fail when renamed
         Shutdown();
     }
 

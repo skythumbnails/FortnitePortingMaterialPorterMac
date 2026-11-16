@@ -115,6 +115,12 @@ class StaticsMixin:
             return bool(p.get("DefaultValue", False))
         return v
 
+    def virtual_texture_blends(self, p):
+        """Whether a VirtualTextureFeatureSwitch blends its branches by where the RVT is baked (env), rather than
+        compiling one: in foliage that doesn't write the RVT, with a PC branch (rocks and props: step 2)."""
+        return not getattr(self, "rvt_output", None) and linked(p.get("Yes")) and \
+            getattr(self.env, "foliage", False) and getattr(self.env, "virtual_texture_available", lambda: False)()
+
     def switch_pin(self, x):
         """The input a compile-time switch compiles (COMPILE_SWITCHES)."""
         p = x.get("Properties") or {}
@@ -123,6 +129,8 @@ class StaticsMixin:
             used = self._hook("landscape_layer", lambda: True, p.get("ParameterName"))
             return p.get("LayerUsed" if used else "LayerNotUsed")
         prefs = COMPILE_SWITCHES[t]
+        if t == "VirtualTextureFeatureSwitch" and getattr(self, "rvt_output", None):
+            prefs = ("Yes",) + prefs        # its own virtual texture is drawable: the PC branch (No is mobile's)
         for k in prefs:
             if linked(p.get(k)):
                 return p[k]
@@ -157,7 +165,7 @@ class StaticsMixin:
                 for f, v in sorted(statics.items(), key=lambda kv: str(kv[0])) if v != dflt.get(f)]
         label = "%s [%s]" % (base, " ".join(diff)) if diff else base
         prefix = getattr(self.env, "function_prefix", FunctionTree.PREFIX)
-        taken = {ft.tree.name for ft in self.functions.values()}
+        taken = {(ft.placeholder or ft.tree).name for ft in self.functions.values()}
         if not statics or not diff:
             # a plain function whose name another function already has
             n = 2
@@ -180,6 +188,19 @@ class StaticsMixin:
             v = bool(p.get("Value", False)) if t == "StaticBool" else \
                 self.static_switch(p.get("ParameterName"), bool(p.get("DefaultValue", False)))
             return self.const(1.0 if v else 0.0)
+        if t == "VirtualTextureFeatureSwitch" and self.virtual_texture_blends(p):
+            # the PC branch where the file's RVT is baked, the no-VT one elsewhere
+            no = self.input(g, p.get("No"), scope, self.const(0.0))
+            self.rvt_reads.append(set())
+            try:
+                yes = self.input(g, p.get("Yes"), scope, self.const(0.0))
+            finally:
+                reads = self.rvt_reads.pop()
+            if not reads <= {0}:
+                # it also reads the RVT's height, normal or roughness, which aren't baked
+                return no
+            self.env.rvt_blended = True     # (build: no Ground Blend on top)
+            return self.lerp(no, yes, self._hook("virtual_texture_valid", lambda: None), label="where the RVT is baked")
         if t in COMPILE_SWITCHES or t == "LandscapeLayerSwitch":
             return self.input(g, self.switch_pin(x), scope, self.const(0.0))
         if t == "StaticComponentMaskParameter":

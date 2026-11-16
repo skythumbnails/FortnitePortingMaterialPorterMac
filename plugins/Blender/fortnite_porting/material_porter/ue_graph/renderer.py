@@ -2,7 +2,8 @@
 
 import math
 
-from .core import TexRef, Val, WATER_DEPTH_DEFAULT, SHELL_ATTRIBUTES, SHELL_VECTORS, render_tan_half_fov
+from .core import (Attrs, NORMAL_PASS, PIXEL_NORMAL, TABLE, TexRef, Val, WATER_DEPTH_DEFAULT, SHELL_ATTRIBUTES, SHELL_VECTORS,
+                   render_tan_half_fov)
 
 
 class RendererMixin:
@@ -43,11 +44,11 @@ class RendererMixin:
 
         def camera():
             n = self.node("ShaderNodeVectorTransform", "camera position", vector_type='POINT', convert_from='CAMERA', convert_to='WORLD')
-            n.inputs[0].default_value = (0.0, 0.0, 0.0)
+            n.inputs["Vector"].default_value = (0.0, 0.0, 0.0)
             return Val(n.outputs[0], 3)
         origin = self.shared("camera position", camera)
         turn = self.node("ShaderNodeVectorTransform", "view to world", vector_type='VECTOR', convert_from='CAMERA', convert_to='WORLD')
-        self.link(self.vmath('NORMALIZE', along, out_w=3), turn.inputs[0])     # (EEVEE's trace wants a unit direction)
+        self.link(self.vmath('NORMALIZE', along, out_w=3), turn.inputs["Vector"])     # (EEVEE's trace wants a unit direction)
         ray = self.node("ShaderNodeRaycast", "scene depth")
         self.link(origin, ray.inputs["Position"])
         self.link(Val(turn.outputs[0], 3), ray.inputs["Direction"])
@@ -57,7 +58,7 @@ class RendererMixin:
 
         def forward():
             n = self.node("ShaderNodeVectorTransform", "camera forward", vector_type='VECTOR', convert_from='CAMERA', convert_to='WORLD')
-            n.inputs[0].default_value = (0.0, 0.0, 1.0)
+            n.inputs["Vector"].default_value = (0.0, 0.0, 1.0)
             return Val(n.outputs[0], 3)
         ahead = self.vmath('DOT_PRODUCT', self.vmath('SUBTRACT', Val(ray.outputs["Hit Position"], 3), origin, out_w=3),
                            self.shared("camera forward", forward))
@@ -262,6 +263,8 @@ class RendererMixin:
             atlas = self.tex_key(p.get("Atlas"))
             row = env.scalar(p.get("ParameterName"), float(p.get("DefaultValue", 0.0)))
             img = env.texture(atlas, "SAMPLERTYPE_LinearColor")
+            if img is not None:
+                img[TABLE] = True
             h = float(img.size[1]) if img is not None and img.size[1] > 1 else 256.0
             time = self.mask(self.input(g, p.get("InputTime"), scope, self.const(0.0)), [0])
             v = self.binop('DIVIDE', self.binop('ADD', row, self.const(0.5)), self.const(h))
@@ -286,11 +289,25 @@ class RendererMixin:
             v = self.sample_array(tex, self.input(g, p.get("Coordinates"), scope, None), p.get("SamplerType", ""))
             return self.rgba_out(Val(v.s, 3), v.a, out)
         if t in ("RuntimeVirtualTextureSampleParameter", "RuntimeVirtualTextureSample"):
-            # the terrain's virtual texture under the object: none here - a
-            # neutral surface, its height far below (height blends stay off)
             vals = [self.const((0.5, 0.5, 0.5), 3), self.const(0.5), self.const(0.5), self.const((0.0, 0.0, 1.0), 3),
                     self.const(-1e6), self.const(0.0), self.const(0.0)]
-            return self.stand_in("runtime virtual texture", vals[min(out, len(vals) - 1)])
+            if getattr(self, "rvt_output", None):
+                # the material's own virtual texture (a landscape samples what it wrote, at the same place):
+                # what its Runtime Virtual Texture Output is given (base colour, specular, roughness, normal, height,
+                # mask, displacement)
+                rg, rx = self.rvt_output
+                rp = rx.get("Properties") or {}
+                pin = ("BaseColor", "Specular", "Roughness", "Normal", "WorldHeight", "Mask", "Displacement")[min(out, 6)]
+                # the Normal's pass reads its own copy: the main one may read PixelNormalWS (Hera's snow), a loop
+                own = {"_id": PIXEL_NORMAL} if self.section[:1] == [NORMAL_PASS] else {}
+                return self.input(rg, rp.get(pin), own, vals[min(out, 6)])
+            # the terrain's virtual texture under the object: its baked Base Color (env), else a neutral surface, its
+            # height far below (height blends stay off)
+            pos = self.input(g, p.get("WorldPosition"), scope, None)
+            if self.rvt_reads:
+                self.rvt_reads[-1].add(out)
+            return self._hook("runtime_virtual_texture", lambda: self.stand_in("runtime virtual texture", vals[min(out, 6)]),
+                              out, pos)
         if t == "ParticleColor":
             rgb, a = self._hook("particle_color", lambda: (self.const((1.0, 1.0, 1.0), 3), self.const(1.0)))
             return self.rgba_out(rgb, a, out)
@@ -354,9 +371,10 @@ class RendererMixin:
             base = self._hook("landscape_uv", lambda: None, index)
             stand = base is None
             if stand:
-                # not on a landscape: world XY in 1 m quads
+                # not on an exported landscape: the world in 1 m quads, on the mapping's plane (XY, XZ, YZ)
                 wp = self.comps(env.world_position(False))
-                base = self.combine([self.binop('DIVIDE', wp[0], self.const(100.0)), self.binop('DIVIDE', wp[1], self.const(100.0))])
+                a, b = ((0, 1), (0, 2), (1, 2))[index]
+                base = self.combine([self.binop('DIVIDE', wp[a], self.const(100.0)), self.binop('DIVIDE', wp[b], self.const(100.0))])
             bu, bv = self.comps(base)[:2]
             scale = 1.0 / (float(p.get("MappingScale", 0.0)) or 1.0)
             rot = math.radians(float(p.get("MappingRotation", 0.0)))
@@ -404,7 +422,7 @@ class RendererMixin:
             return self.binop('ADD', base, self.binop('MULTIPLY', layer, w))
         # LandscapeLayerBlend: weight-blended layers add up; height-blended ones share
         # what their heights make of their weights; alpha-blended ones go over the result
-        out, height_terms, alpha = None, [], []
+        terms, height_terms, alpha = [], [], []
         for layer in p.get("Layers") or []:
             name = layer.get("LayerName")
             w = self.layer_weight(name)
@@ -427,17 +445,44 @@ class RendererMixin:
             elif kind.endswith("AlphaBlend"):
                 alpha.append((value, w))
             else:
-                term = self.binop('MULTIPLY', value, w)
-                out = term if out is None else self.binop('ADD', out, term)
+                terms.append((value, w))
         if height_terms:
             total = height_terms[0][1]
             for _, mw in height_terms[1:]:
                 total = self.math('ADD', total, mw)
-            for value, mw in height_terms:
-                term = self.binop('MULTIPLY', value, self.math('DIVIDE', mw, total))
-                out = term if out is None else self.binop('ADD', out, term)
+            terms += [(value, self.math('DIVIDE', mw, total)) for value, mw in height_terms]
+        if any(isinstance(v.s, Attrs) for v, _ in terms + alpha):
+            # layers of material attributes (Athena's terrain): each attribute blended alike, made when read
+            return Val(LayerAttrs(self, terms, alpha), 0)
+        return self._blend_layers(terms, alpha)
+
+    def _blend_layers(self, terms, alpha):
+        out = None
+        for value, w in terms:
+            term = self.binop('MULTIPLY', value, w)
+            out = term if out is None else self.binop('ADD', out, term)
         if out is None:
             out = self.const(0.0)
         for value, w in alpha:
             out = self.lerp(out, value, w)
         return out
+
+
+class LayerAttrs(Attrs):
+    """A LandscapeLayerBlend of material attribute layers: per attribute, the layers' values blended as single values
+    are (weighted sum, then alpha layers over it); the shading model, which doesn't blend, from the first layer."""
+
+    def __init__(self, tr, terms, alpha):
+        super().__init__()
+        self.tr, self.terms, self.alpha = tr, terms, alpha
+
+    def get(self, name):
+        if name not in self.vals:
+            pick = lambda v: v.s.get(name) if isinstance(v.s, Attrs) else v       # noqa: E731
+            if name == "ShadingModel":
+                first = (self.terms + self.alpha)[0][0]
+                self.vals[name] = pick(first)
+            else:
+                self.vals[name] = self.tr._blend_layers([(pick(v), w) for v, w in self.terms],
+                                                        [(pick(v), w) for v, w in self.alpha])
+        return self.vals[name]

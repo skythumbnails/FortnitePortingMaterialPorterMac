@@ -96,6 +96,28 @@ plane = (knee - hip).cross(ankle - hip)
 check("leg pole in the leg's bend plane", abs((man.data.bones["leg_l_pv_ik_ctrl"].head_local - hip).dot(plane.normalized())) < 1e-4, True)
 check("root width", man.pose.bones["global_ctrl"].custom_shape_wire_width, 3.5)
 check("digit width", man.pose.bones["index_01_l_ctrl"].custom_shape_wire_width, 1.5)
+
+
+def widget(obj, name):
+    """A control's drawn shape in the world: its points."""
+    p = obj.pose.bones[name]
+    m = obj.matrix_world @ p.matrix @ Matrix.LocRotScale(p.custom_shape_translation, p.custom_shape_rotation_euler.to_quaternion(),
+                                                        p.custom_shape_scale_xyz)
+    return [m @ v.co for v in p.custom_shape.data.vertices] if p.custom_shape else []
+
+
+bpy.context.view_layer.update()
+root_pts = widget(man, "root_ctrl")
+# the mannequin faces -Y: the arrow's front-most point is its tip (one point, on the middle line), not the shaft's end
+check("the root arrow points forward", abs(min(root_pts, key=lambda v: v.y).x) < 1e-4, True)
+unmirrored = []
+for name in man.pose.bones.keys():
+    twin = name.replace("_l_", "_r_") if "_l_" in name else name[:-2] + "_r" if name.endswith("_l") else None
+    if twin and twin in man.pose.bones and widget(man, name):
+        right = widget(man, twin)
+        if max(min((Vector((-v.x, v.y, v.z)) - w).length for w in right) for v in widget(man, name)) > 1e-3:
+            unmirrored.append(name)
+check("every widget mirrors its other side", unmirrored, [])
 check("controls collection", "foot_l_ik_ctrl" in man.data.collections["Controls"].bones, True)
 check("spaces in Mechanics", "chest_space" in man.data.collections["Mechanics"].bones, True)
 check("game bones hidden", man.data.collections["Game Bones"].is_visible, False)
@@ -114,13 +136,18 @@ check("a non-humanoid doesn't fit", official_rig.fits(blob), False)
 from fpmp_baseline.material_porter import mesh_hooks  # noqa: E402
 from fpmp_baseline.processing.enums import EExportType, ERigType  # noqa: E402
 hooked = mannequin("hooked")
-mesh_hooks._official(SimpleNamespace(imported_meshes=[{"Skeleton": hooked, "Mesh": None}], type=EExportType.OUTFIT))
+mesh_hooks._official(SimpleNamespace(imported_meshes=[{"Skeleton": hooked, "Mesh": None}], type=EExportType.OUTFIT, options={}))
 check("the hook builds the rig", bool(hooked.data.get("fpmp_official_rig")), True)
+check("no hand controls unless asked", "fingers_l_ctrl" in hooked.pose.bones, False)
+hooked_hands = mannequin("hooked_hands")
+mesh_hooks._official(SimpleNamespace(imported_meshes=[{"Skeleton": hooked_hands, "Mesh": None}], type=EExportType.OUTFIT,
+                                     options={"OfficialRigHandControls": True}))
+check("the app option adds the hand controls", "fingers_l_ctrl" in hooked_hands.pose.bones, True)
 broken = mannequin("broken")
 real = official_rig.create
 official_rig.create = lambda obj, data=None: 1 / 0
 try:
-    mesh_hooks._official(SimpleNamespace(imported_meshes=[{"Skeleton": broken, "Mesh": None}], type=EExportType.OUTFIT))
+    mesh_hooks._official(SimpleNamespace(imported_meshes=[{"Skeleton": broken, "Mesh": None}], type=EExportType.OUTFIT, options={}))
     survived = True
 except Exception:
     survived = False
@@ -156,7 +183,7 @@ def quadruped_bones(name):
 
 
 quad = quadruped_bones("quad_official")
-ctx = SimpleNamespace(imported_meshes=[{"Skeleton": quad, "Mesh": None}], type=EExportType.WILDLIFE, mp_deferred_effects=None)
+ctx = SimpleNamespace(imported_meshes=[{"Skeleton": quad, "Mesh": None}], type=EExportType.WILDLIFE, mp_deferred_effects=None, options={})
 mesh_hooks.after_parts(ctx, ERigType.OFFICIAL, ERigType.TASTY)
 check("Official still rigs a creature (Review Focus 5)", bool(quad.data.get("is_creature_rig")), True)
 check("Official doesn't put the body rig on a creature", bool(quad.data.get("fpmp_official_rig")), False)
@@ -447,7 +474,7 @@ names = [s["name"] for s in data["settings"] if s["name"] in st.pose.bones]
 check("setting controls hidden, no shape", all(st.pose.bones[n].custom_shape is None and
       [c.name for c in st.data.bones[n].collections] == ["Mechanics"] for n in names), True)
 check("Epic's defaults", [official_rig.setting(st, n) for n in ("leg_l_fk_ik_switch", "arm_l_fk_ik_switch", "arm_l_fk_local",
-      "roll_blend_l_ctrl", "arm_l_stretch_switch")], [1.0, 0.0, 1.0, 1.0, 0.0])
+      "roll_blend_l_ctrl", "arm_l_stretch_switch")], [1.0, 0.0, 0.0, 1.0, 0.0])      # FK arms follow the spine (not Epic's 1)
 # stretch: a hand target 1.5 lengths out is reached with stretch on, not off; capped at 2
 official_rig.set_switch(st, "arm_l_fk_ik_switch", ik=True)
 L = (head(st, "lowerarm_l") - head(st, "upperarm_l")).length + (head(st, "hand_l") - head(st, "lowerarm_l")).length
@@ -583,6 +610,16 @@ try:
     rig_ui.register()
 except ValueError:
     pass                # registered earlier in this run
+# the app's rig button with the official rig chosen: the official rig goes on the selected armature, not Tasty's
+from fpmp_baseline.material_porter import mesh_hooks  # noqa: E402
+ab = mannequin("button")
+for o in bpy.context.view_layer.objects:
+    o.select_set(False)
+bpy.context.view_layer.objects.active = ab
+ab.select_set(True)
+check("rig button: Tasty chosen, Tasty's applies", mesh_hooks.apply_rig(SimpleNamespace(options={"RigType": 1}), {}), False)
+check("rig button: official chosen, handled", mesh_hooks.apply_rig(SimpleNamespace(options={"RigType": 2}), {}), True)
+check("rig button: the official rig built", bool(ab.data.get(official_rig.MARK)), True)
 pn = mannequin("panel")
 official_rig.create(pn)
 bpy.context.view_layer.objects.active = pn
@@ -606,24 +643,358 @@ class Layout:
     def column(self, **_):
         return self
 
-    row = column
+    row = split = box = grid_flow = menu_pie = column
 
-    def label(self, text=""):
+    def separator(self, **_):
+        self.log.append(("sep", ""))
+
+    def panel(self, idname, default_closed=False):
+        return self, self           # drawn open
+
+    def label(self, text="", **_):
         self.log.append(("label", text))
 
-    def operator(self, idname, text="", **_):
-        self.log.append(("op", idname, text))
+    def operator(self, idname, text="", depress=False, **_):
+        self.log.append(("op", idname, text, depress))
         return SimpleNamespace()
 
-    def prop(self, owner, path, text=""):
+    def prop(self, owner, path, text="", **_):
         self.log.append(("prop", path, text))
 
 
+from fpmp_baseline.processing.context import official_panel, official_picker  # noqa: E402
 drawn = []
-official_rig.ui(Layout(drawn), pn)
-texts = [d[-1] for d in drawn]
-check("the panel draws every part's switches and settings", all(t in texts for t in ("Stretch", "Soft", "Local", "Roll L",
-      "Body Controls", "Bake to Controls")), True)
+official_panel.ui_top(Layout(drawn), pn)
+official_panel.ui_body(Layout(drawn), pn)
+official_panel.ui_ik(Layout(drawn), pn)
+texts = [d[2] if d[0] == "op" else d[-1] for d in drawn]
+check("the panel draws every part's switches and settings", all(t in texts for t in ("Rig", "Bake to Controls", "Body Controls",
+      "FK", "IK", "Stretch", "Soft", "Local", "Roll L")), True)
+check("the IK / FK rows: all, both arms, both legs, then spine and neck",
+      [label for label, _ in official_panel.groups(pn)], ["All", "Arms", "Legs", "Spine", "Neck"])
+
+# one click switches a group: all IK, then arms back to FK; a group's IK shows pressed only when all its parts are
+ARMS = "arm_l_fk_ik_switch,arm_r_fk_ik_switch"
+EVERY = ",".join(p["switch"] for p in official_panel.parts(pn))
+bpy.ops.fpmp.official_rig_switch(switch=EVERY, ik=True)
+check("All IK switches every part", [official_rig.setting(pn, s) for s in EVERY.split(",")], [1.0] * 6)
+bpy.ops.fpmp.official_rig_switch(switch=ARMS, ik=False)
+check("Arms FK switches both arms only", [official_rig.setting(pn, s) for s in EVERY.split(",")],
+      [0.0 if s.startswith("arm_") else 1.0 for s in EVERY.split(",")])
+drawn = []
+official_panel.ui_ik(Layout(drawn), pn)
+ik_buttons = [d[3] for d in drawn if d[0] == "op" and d[2] == "IK"]
+check("IK pressed: not All (arms are FK), not Arms, Legs, Spine, Neck", ik_buttons[:5], [False, False, True, True, True])
+bpy.ops.fpmp.official_rig_setting(name="arm_l_stretch_switch,leg_l_stretch_switch", value=0.0)
+check("one click sets a setting on several parts", (official_rig.setting(pn, "arm_l_stretch_switch"),
+      official_rig.setting(pn, "leg_l_stretch_switch")), (0.0, 0.0))
+
+# the picker: a limb in IK shows its IK controls, in FK its FK ones; click selects, Shift adds
+check("picker: the left hand in FK is its FK control", list(official_picker.pick(pn, official_picker.L["hand"])), ["Hand", "hand_l_fk_ctrl"])
+check("picker: the left foot in IK is its IK control", list(official_picker.pick(pn, official_picker.L["foot"])), ["Foot", "foot_l_ik_ctrl"])
+check("picker: the left calf cell in IK is the knee", list(official_picker.pick(pn, official_picker.L["calf"])), ["Knee", "leg_l_pv_ik_ctrl"])
+bpy.ops.fpmp.rig_pick(names="head_ik_ctrl")
+check("pick selects only that control, in pose mode", [[b.name for b in pn.pose.bones if b.select], pn.mode], [["head_ik_ctrl"], 'POSE'])
+bpy.ops.fpmp.rig_pick(names="foot_l_ik_ctrl", extend=True)
+check("Shift-pick adds", sorted(b.name for b in pn.pose.bones if b.select), ["foot_l_ik_ctrl", "head_ik_ctrl"])
+check("a finger button holds the finger root to tip", official_picker.finger(pn, "l", "index"),
+      [n for n in ("index_metacarpal_l_ctrl", "index_01_l_ctrl", "index_02_l_ctrl", "index_03_l_ctrl") if n in pn.pose.bones])
+drawn = []
+official_picker.ui_picker(Layout(drawn), pn)
+picked = [d[2] for d in drawn if d[0] == "op"]
+check("the picker draws the body and the fingers", all(t in picked for t in ("Head", "Chest", "Hand", "Knee", "Root", "Fingers L", "T")), True)
+check("selected controls show pressed", [d[2] for d in drawn if d[0] == "op" and d[3]], ["Head", "Foot"])
+from fpmp_baseline.operator import rig_pie  # noqa: E402
+drawn = []
+rig_pie.FPMP_MT_rig_pie.draw(SimpleNamespace(layout=Layout(drawn)), bpy.context)
+pie = [d[2] if d[0] == "op" else d[-1] for d in drawn]
+check("the Shift+Q pie: reset, the rig's switches, IK / FK, picker, body controls",
+      all(t in pie for t in ("Reset Selected", "Rig", "Bake to Controls", "IK / FK", "IK", "Stretch", "Picker…",
+                             "Select All Controls", "Body Controls")), True)
+check("the pie opens on the official rig", rig_pie.FPMP_MT_rig_pie.poll(bpy.context), True)
+bpy.ops.object.mode_set(mode='OBJECT')
+official_rig.set_switch(pn, "neck_fk_ik_switch", ik=False)
+for s in EVERY.split(","):
+    official_rig.set_switch(pn, s, ik=False)
+
+# --- Bake to Controls then IK (user report: IK after a bake twisted the limbs, broke the spine and neck)
+# off-hinge elbows and knees (twisting forearms, as mocap has), a moving pelvis, every spine and neck bone turned
+PARTS = {"arm_l_fk_ik_switch": ("upperarm_l", "lowerarm_l", "hand_l"), "arm_r_fk_ik_switch": ("upperarm_r", "lowerarm_r", "hand_r"),
+         "leg_l_fk_ik_switch": ("thigh_l", "calf_l", "foot_l", "ball_l"), "leg_r_fk_ik_switch": ("thigh_r", "calf_r", "foot_r", "ball_r"),
+         "spine_fk_ik_switch": ("spine_01", "spine_02", "spine_03", "spine_04", "spine_05"),
+         "neck_fk_ik_switch": ("neck_01", "neck_02", "head")}
+TURNS = {"pelvis": (0.3, 0.2, 0.4), "spine_01": (0.2, 0.1, -0.1), "spine_02": (0.15, -0.2, 0.1), "spine_03": (0.1, 0.1, 0.2),
+         "spine_04": (-0.1, 0.05, 0.1), "spine_05": (0.05, 0.2, -0.1), "neck_01": (0.2, 0.1, 0.3), "neck_02": (-0.1, 0.2, 0.1),
+         "head": (0.3, -0.2, 0.2), "upperarm_l": (0.5, 0.3, 0.6), "lowerarm_l": (0.2, 0.4, 0.8), "hand_l": (0.3, 0.2, -0.4),
+         "upperarm_r": (-0.4, 0.5, 0.2), "lowerarm_r": (0.1, -0.6, 0.5), "hand_r": (-0.2, 0.3, 0.3),
+         "thigh_l": (0.6, 0.2, 0.3), "calf_l": (0.7, 0.3, 0.1), "foot_l": (0.2, 0.3, 0.1), "ball_l": (0.3, 0.0, 0.0),
+         "thigh_r": (-0.3, 0.4, 0.2), "calf_r": (0.9, -0.2, 0.3), "foot_r": (-0.2, 0.1, 0.3)}
+bi = mannequin("bake_ik")
+official_rig.create(bi)
+official_rig.on_animation_import(bi)
+bi.animation_data_create()
+for f in (1, 2, 3, 4):
+    k = (f - 1) / 1.5
+    for n, (x, y, z) in TURNS.items():
+        bi.pose.bones[n].rotation_mode = 'XYZ'
+        bi.pose.bones[n].rotation_euler = (x * k, y * k, z * k)
+        bi.pose.bones[n].keyframe_insert("rotation_euler", frame=f)
+    bi.pose.bones["pelvis"].location = (0.1 * k, -0.2 * k, 0.15 * k)
+    bi.pose.bones["pelvis"].keyframe_insert("location", frame=f)
+baked = {}
+for f in (1, 2, 3, 4):
+    bpy.context.scene.frame_set(f)
+    baked[f] = {n: world(bi, n).copy() for bones in PARTS.values() for n in bones}
+official_rig.bake_to_controls(bi, 1, 4)
+
+
+def ik_off_by(obj, switch):
+    """Worst (distance, angle) of a part's bones in IK, unmatched, against the baked animation over its frames."""
+    official_rig.set_switch(obj, switch, ik=True, match=False)
+    worst = [0.0, 0.0]
+    for f in (1, 2, 3, 4):
+        bpy.context.scene.frame_set(f)
+        for n in PARTS[switch]:
+            have, want = world(obj, n), baked[f][n]
+            turn = have.to_quaternion().rotation_difference(want.to_quaternion()).angle
+            worst = [max(worst[0], (have.to_translation() - want.to_translation()).length), max(worst[1], min(turn, 2 * math.pi - turn))]
+    official_rig.set_switch(obj, switch, ik=False, match=False)
+    return worst
+
+
+for switch in PARTS:
+    off = ik_off_by(bi, switch)
+    check("after a bake, %s in IK plays the animation" % switch, off[0] < 1e-4 and off[1] < 1e-3, True)
+    if off[0] >= 1e-4 or off[1] >= 1e-3:
+        print("   %s off by %.2e m, %.3f deg" % (switch, off[0], math.degrees(off[1])))
+for name in ("arm_l_stretch_switch", "leg_r_stretch_switch", "spine_stretch_switch", "head_stretch"):
+    official_rig.set_setting(bi, name, 1.0)
+for switch in ("arm_l_fk_ik_switch", "leg_r_fk_ik_switch", "spine_fk_ik_switch", "neck_fk_ik_switch"):
+    off = ik_off_by(bi, switch)
+    check("after a bake, %s in IK with stretch on plays the animation" % switch, off[0] < 1e-4 and off[1] < 1e-3, True)
+bpy.context.scene.frame_set(4)
+check("the bake still ends in FK, on the animation", all((world(bi, n).to_translation() - m.to_translation()).length < 1e-4
+      and same_rot(world(bi, n), m, 1e-3) for n, m in baked[4].items()), True)
+
+# --- stand-in limbs (user report: TerryBroke's legs and SushiAware's arms didn't move): some characters skin a limb to
+# their own copy of it (terry_thigh_l, upperarm_retarget_lf) that the game's own rig drives from the real one; the
+# official rig parents those copies to the bones its controls drive, keeping their offset
+px = mannequin("proxies")
+bpy.context.view_layer.objects.active = px
+bpy.ops.object.mode_set(mode='EDIT')
+eb = px.data.edit_bones
+
+
+def copy_of(name, source, parent, shift=Vector((0.0, -0.02, 0.0))):
+    b = eb.new(name)
+    b.head, b.tail = eb[source].head + shift, eb[source].tail + shift
+    b.parent = eb[parent] if parent else None
+    return b
+
+
+copy_of("toon_thigh_l", "thigh_l", "pelvis")
+copy_of("toon_calf_l", "calf_l", "toon_thigh_l")
+copy_of("toon_foot_l", "foot_l", "toon_calf_l")
+copy_of("toon_thigh_twist_01_l", "thigh_l", "toon_thigh_l")        # a helper on the copy: stays on it
+copy_of("upperarm_retarget_lf", "upperarm_l", "clavicle_l")
+copy_of("lowerarm_retarget_lf", "lowerarm_l", "upperarm_retarget_lf")
+copy_of("hand_retarget_lf", "hand_l", "lowerarm_retarget_lf")
+copy_of("upperarm_retarget_lf_null", "upperarm_l", "clavicle_l")    # not a stand-in: left alone
+bpy.ops.object.mode_set(mode='OBJECT')
+official_rig.create(px)
+parents = {n: px.data.bones[n].parent.name for n in ("toon_thigh_l", "toon_calf_l", "toon_foot_l", "toon_thigh_twist_01_l",
+                                                     "upperarm_retarget_lf", "lowerarm_retarget_lf", "hand_retarget_lf",
+                                                     "upperarm_retarget_lf_null")}
+check("stand-in limbs ride the bones the rig drives", parents, {
+    "toon_thigh_l": "thigh_l", "toon_calf_l": "calf_l", "toon_foot_l": "foot_l", "toon_thigh_twist_01_l": "toon_thigh_l",
+    "upperarm_retarget_lf": "upperarm_l", "lowerarm_retarget_lf": "lowerarm_l", "hand_retarget_lf": "hand_l",
+    "upperarm_retarget_lf_null": "clavicle_l"})
+check("keeping their place at rest", (px.data.bones["toon_foot_l"].head_local - px.data.bones["foot_l"].head_local
+                                      - Vector((0.0, -0.02, 0.0))).length < 1e-5, True)
+foot_before, hand_before = head(px, "toon_foot_l").copy(), head(px, "hand_retarget_lf").copy()
+foot = px.pose.bones["foot_l_ik_ctrl"]
+foot.location = (0.0, 0.0, 0.0)
+m = foot.matrix.copy()
+m.translation += Vector((0.0, -0.1, 0.15))
+foot.matrix = m
+px.pose.bones["upperarm_l_fk_ctrl"].rotation_mode = 'XYZ'
+px.pose.bones["upperarm_l_fk_ctrl"].rotation_euler = (0.4, 0.2, 0.3)
+check("an IK foot moves the stand-in leg", (head(px, "toon_foot_l") - foot_before).length > 0.1, True)
+check("an FK arm moves the stand-in arm", (head(px, "hand_retarget_lf") - hand_before).length > 0.05, True)
+
+# --- extra hand controls (an app option; not Epic's): curl, spread, palm cup, per-finger curl
+from fpmp_baseline.processing.context import official_hands  # noqa: E402
+LONG = ("index", "middle", "ring", "pinky")
+
+
+def handy(name, layer):
+    """A mannequin with a real left hand (palm down along +X, fingers slightly bent at rest), its rig built."""
+    obj = mannequin(name)
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode='EDIT')
+    eb = obj.data.edit_bones
+    wrist = Vector((0.72, 0.0, 1.42))
+    for i, f in enumerate(LONG):
+        y = -0.025 + i * 0.016
+        eb["%s_metacarpal_l" % f].head = wrist + Vector((0.01, y * 0.5, 0.0))
+        joints = [Vector((0.80, y, 1.42)), Vector((0.84, y, 1.417)), Vector((0.87, y, 1.412)), Vector((0.895, y, 1.405))]
+        eb["%s_metacarpal_l" % f].tail = joints[0]
+        for k in range(3):
+            eb["%s_0%d_l" % (f, k + 1)].head, eb["%s_0%d_l" % (f, k + 1)].tail = joints[k], joints[k + 1]
+    thumb = [Vector((0.74, -0.03, 1.41)), Vector((0.765, -0.05, 1.40)), Vector((0.785, -0.06, 1.395)), Vector((0.80, -0.065, 1.39))]
+    for k in range(3):
+        eb["thumb_0%d_l" % (k + 1)].head, eb["thumb_0%d_l" % (k + 1)].tail = thumb[k], thumb[k + 1]
+    eb["hand_l"].tail = Vector((0.80, 0.0, 1.42))
+    bpy.ops.object.mode_set(mode='OBJECT')
+    official_rig.create(obj)
+    if layer:
+        check("hand controls built", official_hands.build(obj) > 0, True)
+    return obj
+
+
+def tip(obj, finger):
+    return head(obj, "%s_03_l" % finger) + (world(obj, "%s_03_l" % finger).to_3x3() @ Vector((0, obj.data.bones["%s_03_l" % finger].length, 0)))
+
+
+def turn_ctrl(obj, name, euler):
+    pose_bone = obj.pose.bones[name]
+    pose_bone.rotation_mode = 'XYZ'
+    pose_bone.rotation_euler = euler
+    bpy.context.view_layer.update()
+
+
+plain, hands = handy("hands_plain", False), handy("hands_on", True)
+check("without the option there are no hand controls", "fingers_l_ctrl" in plain.pose.bones, False)
+fingers = [b.name for b in hands.data.bones if b.name.endswith("_l") and b.name.split("_")[0] in LONG + ("thumb",)]
+check("at rest the layer changes nothing", all((world(hands, n).to_translation() - world(plain, n).to_translation()).length < 1e-5
+      and same_rot(world(hands, n), world(plain, n), 1e-4) for n in fingers), True)
+rest_tips = {f: tip(hands, f) for f in LONG}
+turn_ctrl(hands, "fingers_l_ctrl", (math.radians(90), 0.0, 0.0))
+wrist = head(hands, "hand_l")
+check("Fingers X closes every finger into a fist", all((tip(hands, f) - wrist).length < (rest_tips[f] - wrist).length - 0.04
+      for f in LONG), True)
+
+
+def bend(obj, a, b):
+    return math.degrees((world(obj, a).to_3x3().col[1]).angle(world(obj, b).to_3x3().col[1]))
+
+
+check("a full curl stays within each knuckle's reach", all(bend(hands, "%s_metacarpal_l" % f, "%s_01_l" % f) <= 91
+      and bend(hands, "%s_01_l" % f, "%s_02_l" % f) <= 106 and bend(hands, "%s_02_l" % f, "%s_03_l" % f) <= 81 for f in LONG), True)
+turn_ctrl(hands, "fingers_l_ctrl", (0.0, 0.0, 0.0))
+gap = (rest_tips["index"] - rest_tips["pinky"]).length
+turn_ctrl(hands, "fingers_l_ctrl", (0.0, 0.0, math.radians(30)))
+check("Fingers Z spreads the fingers", (tip(hands, "index") - tip(hands, "pinky")).length > gap + 0.01, True)
+check("and the middle finger stays", (tip(hands, "middle") - rest_tips["middle"]).length < 1e-3, True)
+turn_ctrl(hands, "fingers_l_ctrl", (0.0, 0.0, 0.0))
+meta_rest = {f: world(hands, "%s_metacarpal_l" % f).copy() for f in ("index", "pinky")}
+turn_ctrl(hands, "palm_l_ctrl", (math.radians(40), 0.0, 0.0))
+cup = {f: math.degrees(world(hands, "%s_metacarpal_l" % f).to_quaternion().rotation_difference(meta_rest[f].to_quaternion()).angle)
+       for f in meta_rest}
+check("Palm X cups the hand, the little finger's side most", cup["pinky"] > 10 and cup["index"] < 1, True)
+turn_ctrl(hands, "palm_l_ctrl", (0.0, 0.0, 0.0))
+turn_ctrl(hands, "ring_l_curl_ctrl", (math.radians(60), 0.0, 0.0))
+check("a finger's curl control curls that finger only", tip(hands, "ring").z < rest_tips["ring"].z - 0.01
+      and (tip(hands, "middle") - rest_tips["middle"]).length < 1e-4, True)
+turn_ctrl(hands, "ring_l_curl_ctrl", (0.0, 0.0, 0.0))
+before = world(hands, "index_02_l").copy()
+turn_ctrl(hands, "index_02_l_ctrl", (0.0, 0.0, math.radians(30)))
+check("Epic's finger control still turns its bone", not same_rot(world(hands, "index_02_l"), before, 0.1), True)
+turn_ctrl(hands, "index_02_l_ctrl", (0.0, 0.0, 0.0))
+def turned(obj, name):
+    """A control's rotation after its constraints, in degrees (local)."""
+    p = obj.pose.bones[name]
+    rest = p.parent.matrix @ p.parent.bone.matrix_local.inverted() @ p.bone.matrix_local
+    return [round(math.degrees(a), 1) for a in (rest.inverted() @ p.matrix).to_euler()]
+
+
+for name, euler, want in (("fingers_l_ctrl", (150, 20, 80), [90.0, 0.0, 45.0]), ("ring_l_curl_ctrl", (-60, 30, 30), [-30.0, 0.0, 0.0]),
+                          ("palm_l_ctrl", (100, 10, 10), [60.0, 0.0, 0.0])):
+    turn_ctrl(hands, name, tuple(math.radians(a) for a in euler))
+    check("%s only turns where it does something" % name, all(abs(a - b) < 0.2 for a, b in zip(turned(hands, name), want)), True)
+    turn_ctrl(hands, name, (0.0, 0.0, 0.0))
+
+check("hand controls sit with the rig's controls", all(n in hands.data.collections["Controls"].bones
+      for n in ("fingers_l_ctrl", "palm_l_ctrl", "index_l_curl_ctrl")), True)
+# held prop: a handle through the fist; the finger joints stop on its surface instead of going through it
+from fpmp_baseline.processing.context import official_grip  # noqa: E402
+official_grip.register()
+turn_ctrl(hands, "fingers_l_ctrl", (math.radians(90), 0.0, 0.0))
+joints = lambda: [head(hands, "%s_0%d_l" % (f, k)) for f in LONG for k in (2, 3)] + [tip(hands, f) for f in LONG]
+fist = joints()
+centre = sum((head(hands, "%s_03_l" % f) for f in LONG), Vector()) / 4
+radius = 0.012
+bpy.ops.mesh.primitive_cylinder_add(radius=radius, depth=0.2, location=centre, rotation=(math.pi / 2, 0.0, 0.0), vertices=64)
+handle = bpy.context.active_object
+handle.name = "handle"
+bpy.context.view_layer.objects.active = hands
+off_axis = lambda p: math.hypot(p.x - centre.x, p.z - centre.z)
+check("without a held prop the fist goes through the handle", min(off_axis(p) for p in fist) < radius - 0.002, True)
+hands.pose.bones["fingers_l_ctrl"].fpmp_held_prop = handle
+bpy.context.view_layer.update()
+held = joints()
+check("with it, every finger joint stays outside the handle", min(off_axis(p) for p in held) > radius - 1e-3, True)
+hands.pose.bones["fingers_l_ctrl"]["finger_wrap"] = 1.0
+hands.update_tag()
+bpy.context.view_layer.update()
+check("Finger Wrap closes the finger joints onto it", max(off_axis(p) for p in joints()[:8]) < radius + 0.015, True)
+# a prop scaled up (and a character with it) is held the same: the joints sit a finger's thickness off its surface,
+# not twice that (user report: a gun scaled 2.2x held the fingers floating off its grip)
+wrapped = [off_axis(p) for p in joints()[:8]]
+hands.scale = (2.0, 2.0, 2.0)
+handle.scale, handle.location = (2.0, 2.0, 2.0), centre * 2.0
+hands.pose.bones["fingers_l_ctrl"].fpmp_held_prop = None        # picked again on the scaled character (the same prop
+bpy.context.view_layer.update()                                 # set twice runs no update)
+hands.pose.bones["fingers_l_ctrl"].fpmp_held_prop = handle
+hands.update_tag()
+bpy.context.view_layer.update()
+scaled = [math.hypot(p.x - centre.x * 2.0, p.z - centre.z * 2.0) / 2.0 for p in joints()[:8]]
+check("scaled 2x, the wrapped joints sit where they do at 1x", max(abs(a - b) for a, b in zip(wrapped, scaled)) < 1e-3, True)
+hands.scale, handle.scale, handle.location = (1.0, 1.0, 1.0), (1.0, 1.0, 1.0), centre
+hands.pose.bones["fingers_l_ctrl"].fpmp_held_prop = handle
+hands.pose.bones["fingers_l_ctrl"]["finger_wrap"] = 0.0
+hands.update_tag()
+hands.pose.bones["fingers_l_ctrl"].fpmp_held_prop = None
+bpy.context.view_layer.update()
+check("taking the prop away gives the plain fist back", max((a - b).length for a, b in zip(joints(), fist)) < 1e-4, True)
+turn_ctrl(hands, "fingers_l_ctrl", (0.0, 0.0, 0.0))
+held_ui = []
+official_panel.ui_hands(Layout(held_ui), hands)
+check("the Held Props panel offers one per hand", official_panel.has_hands(hands) and [d[-1] for d in held_ui if d[0] == "prop" and d[-1].startswith("Held")],
+      ["Held L", "Held R"])
+check("the grip changes nothing at rest", all((world(hands, n).to_translation() - world(plain, n).to_translation()).length < 1e-5
+      for n in fingers), True)
+# Bake to Controls with the layer: the bones land, the hand controls are keyed at rest
+official_rig.on_animation_import(hands)
+hands.animation_data_create()
+for f, angle in ((1, 0.0), (3, 0.6)):
+    for n in ("index_02_l", "pinky_01_l", "thumb_02_l"):
+        hands.pose.bones[n].rotation_mode = 'XYZ'
+        hands.pose.bones[n].rotation_euler = (angle, 0.0, angle * 0.3)
+        hands.pose.bones[n].keyframe_insert("rotation_euler", frame=f)
+    # the arm swings far between frames (a sprint): the fingertips sit nine links down from the clavicle
+    hands.pose.bones["upperarm_l"].rotation_mode = 'XYZ'
+    hands.pose.bones["upperarm_l"].rotation_euler = (angle * 2.0, 0.0, 0.0)
+    hands.pose.bones["upperarm_l"].keyframe_insert("rotation_euler", frame=f)
+tips = ("index_02_l", "pinky_01_l", "thumb_02_l", "index_03_l", "middle_03_l", "pinky_03_l")
+want_hand = {}
+for f in (1, 2, 3):
+    bpy.context.scene.frame_set(f)
+    want_hand[f] = {n: world(hands, n).copy() for n in tips}
+official_rig.bake_to_controls(hands, 1, 3)
+landed = []
+for f in (1, 2, 3):
+    bpy.context.scene.frame_set(f)
+    landed += [(world(hands, n).to_translation() - m.to_translation()).length < 1e-4 and same_rot(world(hands, n), m, 1e-3)
+               for n, m in want_hand[f].items()]
+check("with hand controls, the bake lands on every frame, fingertips too", all(landed), True)
+finger_locs = [fc for layer in hands.animation_data.action.layers for strip in layer.strips for bag in strip.channelbags
+               for fc in bag.fcurves if fc.data_path.endswith('_03_l_ctrl"].location')]
+check("and the finger controls only turn", max((abs(k.co[1]) for fc in finger_locs for k in fc.keyframe_points), default=0.0) < 1e-4, True)
+paths = {fc.data_path for layer in hands.animation_data.action.layers for strip in layer.strips for bag in strip.channelbags
+         for fc in bag.fcurves}
+check("and the hand controls are keyed at rest", 'pose.bones["fingers_l_ctrl"].rotation_quaternion' in paths
+      or 'pose.bones["fingers_l_ctrl"].rotation_euler' in paths, True)
 
 print("[official_rig_check] %d passed, %d failed" % (PASSES[0], len(FAILS)))
 sys.exit(1 if FAILS else 0)

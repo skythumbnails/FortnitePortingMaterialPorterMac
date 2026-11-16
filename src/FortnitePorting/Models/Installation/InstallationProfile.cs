@@ -70,11 +70,11 @@ public partial class InstallationProfile : ObservableValidator
     [JsonIgnore] public bool UnrealVersionEnabled => IsCustom;
     [JsonIgnore] public bool EncryptionKeyEnabled => IsCustom;
     [JsonIgnore] public bool MappingsFileEnabled => IsCustom;
-    // MP: a downloaded build streams, and so does a Custom install with its own on-demand TOC
-    // macOS: Fortnite 41.20+ moved cosmetic icon textures into the IAS on-demand container
+    // Fortnite 41.20+ moved cosmetic icon textures into the IAS on-demand container
     // (pakchunk100iad), which is only reachable through .uondemandtoc registration. That
     // registration is gated on TextureStreamingEnabled, so On-Demand installs need it too —
     // without it every cosmetic icon falls back to the pink placeholder.
+    // MP: a downloaded build streams, and so does a Custom install with its own on-demand TOC
     [JsonIgnore] public bool TextureStreamingEnabled => FortniteVersion is EFortniteVersion.LatestInstalled or EFortniteVersion.LatestOnDemand || IsCustomOnDemand || IsCustom && HasOnDemandToc;
     [JsonIgnore] public bool LoadInstalledBundlesEnabled => FortniteVersion is EFortniteVersion.LatestInstalled;
     [JsonIgnore] public bool CanFetchVersion => !string.IsNullOrWhiteSpace(FetchVersion);

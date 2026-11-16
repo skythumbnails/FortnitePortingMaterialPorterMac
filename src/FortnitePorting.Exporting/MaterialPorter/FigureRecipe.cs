@@ -7,6 +7,7 @@ using global::CUE4Parse.UE4.Assets.Exports.Texture;
 using global::CUE4Parse_Conversion.Textures;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using FortnitePorting.CUE4Parse.Extensions;
 
 namespace FortnitePorting.Exporting.MaterialPorter;
 
@@ -139,7 +140,7 @@ public sealed class FigureRecipe
             _skeleton ??= await provider.LoadPackageObjectAsync<USkeleton>(SkeletonPath);
             if (_lut is null)
             {
-                var lut = (await provider.LoadPackageObjectAsync<UTexture2D>(LutPath)).Decode(ETexturePlatform.DesktopMobile)
+                var lut = (await provider.LoadPackageObjectAsync<UTexture2D>(LutPath)).Decode(global::FortnitePorting.Shared.Options.SharedExportOptions.Default)
                           ?? throw new InvalidDataException("the LEGO colour LUT doesn't decode");
                 var rgba = new byte[lut.Width * 4];
                 var bgra = lut.PixelFormat == global::CUE4Parse.UE4.Assets.Exports.Texture.EPixelFormat.PF_B8G8R8A8;
@@ -285,7 +286,7 @@ public sealed class FigureRecipe
             {
                 foreach (var p in mi.ScalarParameterValues)
                     if (p.ParameterInfo.Name.Text.Equals(name, StringComparison.OrdinalIgnoreCase)) return p.ParameterValue;
-                mi = mi.Parent as UMaterialInstanceConstant;
+                mi = mi.Parent?.LoadOrDefault<UMaterialInstanceConstant>();
             }
         }
         catch

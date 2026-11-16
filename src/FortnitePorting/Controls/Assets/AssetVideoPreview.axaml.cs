@@ -47,17 +47,26 @@ public partial class AssetVideoPreview : UserControl
 
     private void OnAttached(object? sender, VisualTreeAttachmentEventArgs e)
     {
-        if (!AppSettings.Application.ShowVideoPreviews) return;
-        if (string.IsNullOrWhiteSpace(CosmeticId)) return;
+        if (!AppSettings.Application.ShowVideoPreviews || string.IsNullOrWhiteSpace(CosmeticId))
+        {
+            IsVideoReady = false;
+            return;
+        }
 
         IsVideoReady = false;
         _preview = null;
 
+        CancelLoad();
+
         var cts = new CancellationTokenSource();
         _loadCts = cts;
-
+        var token = cts.Token;
         var cosmeticId = CosmeticId;
-        TaskService.Run(async () => await LoadAsync(cosmeticId, cts.Token));
+        TaskService.Run(async () =>
+        {
+            if (token.IsCancellationRequested) return;
+            await LoadAsync(cosmeticId, token);
+        });
     }
 
     private void OnDetached(object? sender, VisualTreeAttachmentEventArgs e)
@@ -65,11 +74,18 @@ public partial class AssetVideoPreview : UserControl
         IsVideoReady = false;
         _preview = null;
 
-        _loadCts?.Cancel();
-        _loadCts?.Dispose();
-        _loadCts = null;
+        CancelLoad();
 
         TaskService.Run(async () => await TearDownAsync());
+    }
+
+    private void CancelLoad()
+    {
+        if (_loadCts is null) return;
+
+        _loadCts.Cancel();
+        _loadCts.Dispose();
+        _loadCts = null;
     }
 
     private async Task LoadAsync(string cosmeticId, CancellationToken cancellationToken)
@@ -88,7 +104,9 @@ public partial class AssetVideoPreview : UserControl
             if (cancellationToken.IsCancellationRequested) return;
 
             var preview = await Api.FortniteGG.ResolvePreview(cosmeticId);
-            if (cancellationToken.IsCancellationRequested || preview is null) return;
+            if (cancellationToken.IsCancellationRequested) return;
+
+            if (preview is null) return;
 
             await TaskService.RunDispatcherAsync(() =>
             {
@@ -220,8 +238,9 @@ public partial class AssetVideoPreview : UserControl
                 Core.Initialize(Path.Combine(vlcApp, "Contents", "MacOS", "lib"));
                 return new LibVLC(false, "--quiet", "--verbose=-1", "--no-video-title-show", "--no-video-on-top", "--avcodec-hw=none");
             }
-            catch (Exception)
+            catch (Exception e)
             {
+                Log.Warning("Video preview unavailable, libvlc failed to load from {VlcApp}: {Message}", vlcApp, e.Message);
                 return null;
             }
         }

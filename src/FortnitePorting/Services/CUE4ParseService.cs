@@ -10,7 +10,6 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform;
 using CUE4Parse_Conversion.Textures;
-using CUE4Parse_Conversion.Textures.BC;
 using CUE4Parse.Compression;
 using CUE4Parse.Encryption.Aes;
 using CUE4Parse.MappingsProvider;
@@ -47,7 +46,6 @@ using FortnitePorting.Models.CUE4Parse;
 using FortnitePorting.Models.Information;
 using FortnitePorting.Rendering.Preview;
 using FortnitePorting.Shared.Extensions;
-using FortnitePorting.Views;
 using FortnitePorting.Views.Settings;
 using Serilog;
 using UE4Config.Parsing;
@@ -121,7 +119,7 @@ public partial class CUE4ParseService : ObservableObject, IService, IResettable
                     IsPrimary = true,
                     Action = () => TaskService.Run(async () =>
                     {
-                        Navigation.App.Open<SettingsView>();
+                        AppWM.OpenSettings();
                         await Task.Delay(250);
                         Navigation.Settings.Open<InstallationSettingsView>();
                     })
@@ -225,14 +223,6 @@ public partial class CUE4ParseService : ObservableObject, IService, IResettable
     [LoadingStage("Initializing CUE4Parse", stage: 0, weight: 5)]
     private async Task InitializeProviderSetup()
     {
-        if (!OperatingSystem.IsWindows())
-        {
-            // Detex.dll is Windows-only. Route BC1-BC7 textures through the managed AssetRipper
-            // decoder so cosmetic icons (typically BC7) render without it. ETC formats still need
-            // Detex but aren't used by Fortnite cosmetics on PC.
-            TextureDecoder.UseAssetRipperTextureDecoder = true;
-        }
-
         Provider = AppSettings.Installation.CurrentProfile.FortniteVersion switch
         {
             EFortniteVersion.LatestOnDemand => new HybridFileProvider(new VersionContainer(LATEST_GAME_VERSION)),
@@ -265,15 +255,6 @@ public partial class CUE4ParseService : ObservableObject, IService, IResettable
         Provider.LoadOnDemandTocs = AppSettings.Installation.CurrentProfile is { TextureStreamingEnabled: true, UseTextureStreaming: true };
         Provider.LoadExtraDirectories = AppSettings.Installation.CurrentProfile.LoadInstalledBundles;
         Provider.ReadNaniteData = AppSettings.Installation.CurrentProfile.LoadNaniteData;
-        // (a Custom on-demand build streams through these; Latest On-Demand replaces them with the chunk host
-        // Epic's manifest response names, InitializeProvider)
-        Provider.OnDemandOptions = new IoStoreOnDemandOptions
-        {
-            ChunkHostUri = new Uri("https://egdownload.fastly-edge.com/", UriKind.Absolute),
-            ChunkCacheDirectory = CacheFolder,
-            Authorization = new AuthenticationHeaderValue("Bearer", AppSettings.Application.EpicAuth?.Token),
-            Timeout = TimeSpan.FromSeconds(AppSettings.Developer.RequestTimeoutSeconds)
-        };
         // (the archives mount in parallel, hundreds of them: each one setting the status and logging it queued every
         // mount on the UI dispatcher's lock and the log file's. The status shows one at most every 100 ms; CUE4Parse
         // logs each mount itself)
@@ -343,35 +324,17 @@ public partial class CUE4ParseService : ObservableObject, IService, IResettable
         }
     }
     
-    [LoadingStage("Loading Detex", stage: 3, weight: 1)]
-    private async Task InitializeDetex()
+    [LoadingStage("Loading Oodle", stage: 3, weight: 1)]
+    private async Task InitializeNativeOodle()
     {
-        if (!OperatingSystem.IsWindows())
-        {
-            // Restore native Oodle on macOS: the managed OodleSharp fallback added upstream in
-            // 4.2.1 cannot decompress some streamed texture/mesh blocks (exports lose parts,
-            // "Failed to decompress Oodle data ... Result: 0"). Same dylib we shipped through 4.1.9.
-            Dependencies.EnsureNoodle();
-            await OodleHelper.InitializeAsync(Dependencies.NoodleFile.FullName);
-            Log.Information("Native Oodle initialized: {Path}", Dependencies.NoodleFile.FullName);
-        }
+        if (OperatingSystem.IsWindows()) return;
 
-        if (!OperatingSystem.IsWindows())
-        {
-            // Detex is shipped as a Windows-only DLL. Remove any stale copy a prior run may have
-            // written and skip initialization — only ETC/BPTC textures depend on it.
-            var stalePath = Path.Combine(App.DataFolder.FullName, DetexHelper.DLL_NAME);
-            if (File.Exists(stalePath))
-            {
-                try { File.Delete(stalePath); }
-                catch (Exception ex) { Log.Warning(ex, "Could not remove stale {Path}", stalePath); }
-            }
-            return;
-        }
-
-        var detexPath = Path.Combine(App.DataFolder.FullName, DetexHelper.DLL_NAME);
-        if (!File.Exists(detexPath)) await DetexHelper.LoadDllAsync(detexPath);
-        DetexHelper.Initialize(detexPath);
+        // Restore native Oodle on macOS: the managed OodleSharp fallback added upstream in
+        // 4.2.1 cannot decompress some streamed texture/mesh blocks (exports lose parts,
+        // "Failed to decompress Oodle data ... Result: 0"). Same dylib we shipped through 4.1.9.
+        Dependencies.EnsureNoodle();
+        await OodleHelper.InitializeAsync(Dependencies.NoodleFile.FullName);
+        Log.Information("Native Oodle initialized: {Path}", Dependencies.NoodleFile.FullName);
     }
     
     [LoadingStage("Initializing Provider", stage: 4, weight: 10)]
@@ -505,6 +468,7 @@ public partial class CUE4ParseService : ObservableObject, IService, IResettable
             Log.Warning("Failed to register content-build archives: {Error}", e.ToString());
         }
     }
+
     [LoadingStage("Loading Texture Streaming", stage: 5, weight: 5)]
     private async Task InitializeTextureStreaming()
     {
@@ -581,6 +545,7 @@ public partial class CUE4ParseService : ObservableObject, IService, IResettable
     [LoadingStage("Loading Virtual Paths", stage: 7, weight: 15)]
     private async Task LoadVirtualPaths()
     {
+        RegisterProjectFiles();     // MP
         Provider.LoadVirtualPaths();
         Provider.PostMount();
         PreferCookedFiles();     // MP
@@ -910,8 +875,13 @@ public partial class CUE4ParseService : ObservableObject, IService, IResettable
             .FirstOrDefault(loader => loader.ClassNames.Contains(obj.ExportType));
         if (assetLoader is not null && pointer.TryLoad(out var assetObj))
         {
-            icon = (assetLoader.LowResIconHandler(assetObj) ?? assetLoader.HighResIconHandler(assetObj))
-                ?.Decode(maxMipSize: 128)?.ToWriteableBitmap();
+            var iconPath = assetLoader.LowResIconHandler(assetObj) ?? assetLoader.HighResIconHandler(assetObj);
+            if (iconPath is not null
+                && package.Provider is { } provider
+                && provider.TryLoadPackageObject<UTexture2D>(iconPath, out var iconTexture))
+            {
+                icon = iconTexture.Decode(maxMipSize: 128)?.ToWriteableBitmap();
+            }
             displayName = assetLoader.DisplayNameHandler(assetObj);
             return (icon, displayName, exportType);
         }

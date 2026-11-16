@@ -59,7 +59,7 @@ UE_DEFAULTS = {
 #   FeatureLevelSwitch  Inputs[4] = SM6 (DX12)
 #   ShadingPathSwitch   Inputs[0] = Deferred (serialized as "Inputs")
 # Virtual-texture and distance-field switches take "No", the branch Blender can
-# draw ("Yes" samples renderer-only data).
+# draw ("Yes" samples renderer-only data); a virtual-texture switch blends to "Yes" where an RVT is baked (env).
 COMPILE_SWITCHES = {
     "QualitySwitch": ("Inputs[3]", "Default"),
     "FeatureLevelSwitch": ("Inputs[4]", "Default"),
@@ -76,6 +76,9 @@ COMPILE_SWITCHES = {
     "ShadowReplace": ("Default",),
     "RuntimeVirtualTextureReplace": ("Default",),
 }
+
+# on an image read as a table (a curve atlas): sampled Linear, as UE does; Smart's cubic blends rows
+TABLE = "mp_table"
 
 BOUNDS_CENTRE = "mp_bounds_centre"     # object bounds centre (local, Blender metres): UE's Object Position
 BOUNDS_MIN = "mp_bounds_min"       # object bounding box (local, Blender metres): UE's local bounds,
@@ -452,8 +455,8 @@ UNREAD_PINS = {
     "SceneDepthWithoutWater": {"Input"},
     "SceneTexture": {"Coordinates"}, "DistanceFieldApproxAO": {"BaseDistance", "Radius", "Normal", "Position"},
     "SkyAtmosphereLightIlluminance": {"WorldPosition"}, "SamplePhysicsVectorField": {"WorldPosition"},
-    "RuntimeVirtualTextureSampleParameter": {"WorldPosition", "Coordinates"},
-    "RuntimeVirtualTextureSample": {"WorldPosition", "Coordinates"},
+    "RuntimeVirtualTextureSampleParameter": {"Coordinates"},
+    "RuntimeVirtualTextureSample": {"Coordinates"},
 }
 
 
@@ -486,11 +489,12 @@ def handled_types():
 
 class TexRef:
     """A texture as a value: what TextureObject(Parameter) hands a sample."""
-    __slots__ = ("name", "volume")
+    __slots__ = ("name", "volume", "sampler", "array")
 
-    def __init__(self, name, volume=False):
-        # name: the env's key for it (an object path with env.asset_paths)
-        self.name, self.volume = name, volume
+    def __init__(self, name, volume=False, sampler="", array=False):
+        # name: the env's key for it (an object path with env.asset_paths); sampler: the object's
+        # SamplerType, which UE uses for a sample reading it (the sample's own is ignored)
+        self.name, self.volume, self.sampler, self.array = name, volume, sampler, array
 
 
 class Val:
@@ -615,6 +619,8 @@ class Graph:
     @staticmethod
     def full_name(x):
         outer = inner_path(str((x.get("Outer") or {}).get("ObjectName", "")))
+        if not outer:       # a top-level expression: its references name it bare (key())
+            return x.get("Name")
         return "%s%s%s" % (outer, "." if ":" in outer else ":", x.get("Name"))
 
     def key(self, ref):
@@ -659,6 +665,9 @@ class FunctionTree:
     (`statics`, input id -> bool; `label` names the variant).
     """
     PREFIX = "FPv4 Sky - "
+    # twins: what the body asked the env (Facts) and its key; a reused group's base, name holder
+    facts = key = base = placeholder = None
+    reused = False
 
     def __init__(self, parent, fname, fg, statics=None, label=None):
         import bpy
@@ -679,6 +688,7 @@ class FunctionTree:
         self.go = self.tree.nodes.new("NodeGroupOutput")
         self.gi[SECTION_KEY] = self.go[SECTION_KEY] = self.tr.section[0]
         self.kind = {}          # input socket name -> ("ue", input id) | ("env", name)
+        self.items = {}         # ue input socket name -> its interface item
         self.ue_names = {}      # UE input id -> socket name
         self.previews = {}      # socket name -> preview expression ref, for callers that leave it
         self.outs = {}          # output id -> (socket name, width); width "attrs" for Material Attributes
@@ -686,6 +696,7 @@ class FunctionTree:
         self.needs = {}
         self.const_outs = {}    # socket name -> Val: an output known when built goes to callers as data
         self.textures = {}      # closure input socket name -> (texture key, sampler, image, own sampler, address)
+        self.site = None        # (caller's translator, its inputs) while a call builds an output
 
     def _new_input(self, name, width, kind):
         base, i = name, 2
@@ -696,7 +707,7 @@ class FunctionTree:
                 return name
             name = socket_name("%s %d" % (base, i))
             i += 1
-        self.tree.interface.new_socket(name, in_out='INPUT', socket_type=SOCKET_OF_WIDTH[width])
+        self.items[name] = self.tree.interface.new_socket(name, in_out='INPUT', socket_type=SOCKET_OF_WIDTH[width])
         self.kind[name] = kind
         return name
 
@@ -708,12 +719,18 @@ class FunctionTree:
             return self.tr.const(1.0 if self.statics.get(fid) else 0.0)
         if p.get("InputType") == ATTRIBUTES_INPUT:
             return Val(OpenAttrs(self, fid, p.get("InputName") or "Material Attributes"), 0)
+        point = getattr(self.tr.env, "probe", None)
+        if point is not None and self.site is not None and self.site[1].get(fid) is not None:
+            # a map texture's coordinates probed (maptex): the caller's value, which the shared group can't know
+            caller, lazy = self.site[0], self.site[1][fid]
+            v = caller.input(lazy.g, lazy.ref, dict(lazy.scope, _id=("map probe", point, lazy.scope.get("_id"))), None)
+            if v is not None:
+                return v
         if fid not in self.ue_names:
             w = INPUT_WIDTH.get(p.get("InputType"), 3)
             name = self._new_input(p.get("InputName") or "Input", w, ("ue", fid))
             self.ue_names[fid] = name
-            item = next(it for it in self.tree.interface.items_tree
-                        if it.item_type == 'SOCKET' and it.in_out == 'INPUT' and it.name == name)
+            item = self.items[name]
             v = p.get("PreviewValue", {})
             dflt = (v.get("X", 0.0), v.get("Y", 0.0), v.get("Z", 0.0))
             if p.get("bUsePreviewValueAsDefault"):
@@ -736,15 +753,13 @@ class FunctionTree:
         # the socket's name may be cut (socket_name); the env gets its key back whole
         name = socket_name(key)
         if name not in self.kind:
-            self.tree.interface.new_socket(name, in_out='INPUT', socket_type=socket_type)
-            item = next(it for it in self.tree.interface.items_tree
-                        if it.item_type == 'SOCKET' and it.in_out == 'INPUT' and it.name == name)
+            # (each interface edit updates the group and its users: the description comes with the socket)
+            item = self.tree.interface.new_socket(name, description=description, in_out='INPUT', socket_type=socket_type)
             if default is not None:
                 try:
                     item.default_value = default
                 except Exception:
                     pass
-            item.description = description
             self.kind[name] = ("env", key)
         return Val(self.gi.outputs[name], WIDTH_OF_SOCKET.get(socket_type, 3))
 
@@ -885,10 +900,18 @@ class SpecialInputs(list):
         return (x.get(self.tr) for x in list.__iter__(self))
 
 
+_DEPS = {}      # tree pointer -> ((name, node and link counts), group_deps): cleared per material (build_one)
+
+
 def group_deps(tree, memo):
     """{output socket identifier: {input socket identifiers it reads}} of a node group."""
     if tree.name in memo:
         return memo[tree.name]
+    stamp = (len(tree.nodes), len(tree.links))
+    cached = _DEPS.get(tree.as_pointer())
+    if cached is not None and cached[0] == (tree.name, stamp):     # unchanged since: callers pass a fresh memo
+        memo[tree.name] = cached[1]
+        return cached[1]
     memo[tree.name] = {}        # a group inside itself can't be; guard anyway
     feeds, order, indeg = {}, [], {}
     nodes = {n.name: n for n in tree.nodes}
@@ -927,6 +950,7 @@ def group_deps(tree, memo):
     go = next((n for n in tree.nodes if n.bl_idname == "NodeGroupOutput" and n.is_active_output), None) \
         or next((n for n in tree.nodes if n.bl_idname == "NodeGroupOutput"), None)
     memo[tree.name] = dict(reads.get(go.name, {})) if go is not None else {}
+    _DEPS[tree.as_pointer()] = ((tree.name, stamp), memo[tree.name])
     return memo[tree.name]
 
 

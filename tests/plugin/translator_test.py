@@ -34,6 +34,12 @@ PASSES = [0]
 # load_graph caches by (path, mtime, size): a file rewritten within one clock tick reads as the old graph
 SAVED = set()
 REWRITTEN = [0]
+# what the Geometry node gives (Blender's normal faces the viewer: flipped on a back face)
+GEOMETRY = {"Normal": (0.0, 0.0, 1.0), "Backfacing": 0.0}
+# what Attribute nodes (by name; missing ones read 0, as in Blender) and the Texture Coordinate node give
+ATTRIBUTES = {}
+TEXCOORD = {}
+OBJECT_INFO = {}    # the Object Info node's outputs by name (Location in metres)
 
 
 # ------------------------------------------------------------ evaluator
@@ -135,6 +141,15 @@ def ev(sock, ctx=()):
             if node.clamp_factor:
                 t = max(0.0, min(1.0, t))
             return a + (b - a) * t
+        if node.data_type == 'RGBA':
+            t, a, b = i(0), i(6), i(7)
+            if node.clamp_factor:
+                t = max(0.0, min(1.0, t))
+            if node.blend_type == 'MULTIPLY':
+                b = _cw(lambda x, y: x * y, a, b)
+            elif node.blend_type != 'MIX':
+                raise RuntimeError("evaluator: no %s colour mix" % node.blend_type)
+            return _cw(lambda x, y: x + (y - x) * t, a, b)
         a, b = i(4), i(5)
         t = i(1) if node.factor_mode == 'NON_UNIFORM' else (i(0),) * 3
         return _cw(lambda x, y, s: x + (y - x) * s, a, b, t)
@@ -163,6 +178,18 @@ def ev(sock, ctx=()):
         if node.data_type == 'FLOAT':
             return one(*(i(j) for j in range(5)))
         return _cw(one, i(6), i(7), i(8), i(9), i(10))
+    if k == "ShaderNodeNewGeometry":
+        return GEOMETRY[sock.name]
+    if k == "ShaderNodeAttribute":
+        v = ATTRIBUTES.get(node.attribute_name, (0.0, 0.0, 0.0))
+        return _num(v) if sock.name == "Fac" else _vec(v)
+    if k == "ShaderNodeTexCoord":
+        return TEXCOORD.get(sock.name, (0.0, 0.0, 0.0))
+    if k == "ShaderNodeObjectInfo":
+        return OBJECT_INFO.get(sock.name, (0.0, 0.0, 0.0))
+    if k == "ShaderNodeRGBToBW":
+        c = i(0)
+        return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]     # scene linear (Rec. 709) luminance
     if k == "ShaderNodeTexImage":
         px = tuple(node.image.pixels[:4])
         return px[3] if sock.name == "Alpha" else px[:3]
@@ -337,6 +364,8 @@ class TestEnv:
         return self.tr.const((0.0, 0.0, 0.0), 3)
 
     def vertex_normal(self):
+        if self.over.get("geometry"):       # the translator's own, from the Geometry node (GEOMETRY)
+            return None
         return self.tr.const(self.over.get("normal", (0.0, 0.0, 1.0)), 3)
 
     def vertex_tangent(self):
@@ -469,6 +498,19 @@ check("Clamp min only", expr(lambda g: g.add("Clamp", Input=R(scalar(g, 5.0)), C
 check("Clamp max only", expr(lambda g: g.add("Clamp", Input=R(scalar(g, -3.0)), ClampMode="EClampMode::CMODE_ClampMax"))[0], -3.0)
 check("Clamp vector", expr(lambda g: g.add("Clamp", Input=R(const3(g, (-1.0, 0.5, 2.0)))))[0], (0.0, 0.5, 1.0))
 
+# SphereMask: a linked Hardness is 0..1, only the HardnessPercent constant is in percent (the anime pupils)
+check("SphereMask linked hardness", expr(lambda g: g.add("SphereMask", A=R(scalar(g, 0.95)), B=R(scalar(g, 0.0)),
+                                                         Radius=R(scalar(g, 1.0)), Hardness=R(scalar(g, 0.9))))[0], 0.5)
+check("SphereMask hardness percent", expr(lambda g: g.add("SphereMask", A=R(scalar(g, 0.95)), B=R(scalar(g, 0.0)),
+                                                          AttenuationRadius=1.0, HardnessPercent=90.0))[0], 0.5)
+
+
+# VertexNormalWS isn't flipped on a back face (UE flips only the pixel normal): the inverted-hull outlines' facing test
+GEOMETRY.update(Normal=(0.0, 0.0, -1.0), Backfacing=1.0)
+check("VertexNormalWS on a back face", expr(lambda g: g.add("VertexNormalWS"), geometry=True)[0], (0.0, 0.0, 1.0))
+check("PixelNormalWS on a back face", expr(lambda g: g.add("PixelNormalWS"), geometry=True)[0], (0.0, 0.0, -1.0))
+GEOMETRY.update(Normal=(0.0, 0.0, 1.0), Backfacing=0.0)
+
 
 # If: A >= B picks Greater; the Equals pin within the threshold; ConstB
 def if_graph(a, b, with_eq, const_b=None):
@@ -553,6 +595,50 @@ else:
 function("MF_Outer", lambda g: call(g, "MF_Pick", {"UseX": fn_input(g, "Flag", "StaticBool")}))
 check("static bool through two functions", expr(lambda g: call(g, "MF_Outer", {"Flag": g.add("StaticBool", Value=True)}))[0], 10.0)
 check("static bool preview default", expr(lambda g: call(g, "MF_Outer", {}))[0], 20.0)
+
+
+# an unwired input's preview is compiled inside the call: it reads the call's other inputs (the anime
+# shader's OverrideNormal_WS preview reads Normal_Map; built without them, Normal_WS was 0 and the cel
+# bands followed the camera)
+def _lit(g):
+    n = fn_input(g, "Normal_Map", "Vector3")
+    over = g.add("FunctionInput", Id="IN_OverrideNormal_WS", InputName="OverrideNormal_WS",
+                 InputType="EFunctionInputType::FunctionInput_Vector3", Preview=R(g.add("Normalize", VectorInput=R(n))),
+                 bUsePreviewValueAsDefault=True)
+    light = g.add("Custom", Code="return View.DirectionalLightDirection;", OutputType="ECustomMaterialOutputType::CMOT_Float3")
+    return g.add("DotProduct", A=R(light), B=R(over))
+
+
+function("MF_AnimeLit", _lit)
+
+
+def anime_ndotl(**over):
+    return expr(lambda g: call(g, "MF_AnimeLit", {"Normal_Map": vector(g, (0.0, 0.0, 2.0))}), **over)[0]
+
+
+check("anime: preview reads the call's inputs (N.L)", anime_ndotl(), 0.8)
+check("anime: N.L ignores the camera", anime_ndotl(camera=(1.0, 0.0, 0.0)), 0.8)
+check("anime: N.L follows the light", anime_ndotl(light=(0.0, 0.8, -0.6)), -0.6)
+
+# a map probe works a call out inline: a shared group built under it kept the probe's constants
+# (Alastor's face lines read DF 0.5 and covered his whole head)
+function("MF_Twice", lambda g: g.add("Multiply", A=R(fn_input(g, "X")), ConstB=2.0))
+_g = G()
+_out = call(_g, "MF_Twice", {"X": scalar(_g, 2.0)})
+_path = _g.save("M_probe", _out)
+_env = TestEnv()
+_tr = Translator(bpy.data.node_groups.new("_test", "ShaderNodeTree"), _env)
+_env.h[0] = _tr
+_env.probe = (0.0, 0.0, 0.0)
+check("probe: a call works out inline", value(_tr.material_output(_path, "EmissiveColor")), 4.0)
+check("probe: no shared group built under it", float(len(_tr.functions)), 0.0)
+_env.probe = None
+_env2 = TestEnv()
+_tr2 = Translator(bpy.data.node_groups.new("_test", "ShaderNodeTree"), _env2)
+_env2.h[0] = _tr2
+check("probe: after it, the group's input is a socket", value(_tr2.material_output(_path, "EmissiveColor")), 4.0)
+check("probe: ...named X", float(any(it.name == "X" for ft in _tr2.functions.values() for it in ft.tree.interface.items_tree
+                                     if it.item_type == 'SOCKET' and it.in_out == 'INPUT')), 1.0)
 
 # compile-time switches take the shipping branch
 check("QualitySwitch Epic", expr(lambda g: g.add("QualitySwitch", Default=R(g.add("Constant", R=1.0)),
@@ -826,6 +912,15 @@ if socks != ["Layer: Base Color", "Result: Base Color"]:
 else:
     PASSES[0] += 1
 
+# a plain value into a Material Attributes input is every attribute (Asteria grass's FN_RVT_Switch_Material)
+g = G()
+a, _ = run_attrs(g, call(g, "MF_Tint", {"Layer": vector(g, (0.4, 0.6, 0.8))}))
+check("plain value into attributes input", a["BaseColor"], (0.2, 0.3, 0.4))
+function("MF_PassAttrs", lambda g: g.add("Reroute", Input=R(fn_input(g, "Layer", "MaterialAttributes"))))
+g = G()
+a, _ = run_attrs(g, call(g, "MF_PassAttrs", {"Layer": vector(g, (0.4, 0.6, 0.8))}))
+check("plain value through attributes input", a["BaseColor"], (0.4, 0.6, 0.8))
+
 # plain pins read as attributes (a material without Material Attributes)
 g = G()
 g.save("M_plain", None)
@@ -875,6 +970,14 @@ ref = dict(R("MaterialExpressionConstant_1"), Expression={
     "ObjectName": "MaterialExpressionConstant'M_Dup:MaterialGraph_0.MaterialGraphNode_Composite_4.Collapsed Nodes."
                   "MaterialExpressionConstant_1'"})
 check("duplicate names resolved by path", run(g, ref)[0], 7.0)
+# the material's own copy has no Outer and its refs name it bare (the LEGO head, M_Figure_RigDrivenFace_rc1)
+g = G()
+g.add("Constant", _name="MaterialExpressionConstant_1", R=3.0)
+g.add("Constant", _name="MaterialExpressionConstant_1",
+      _outer="MaterialGraph'MaterialGraph_2:MaterialGraphNode_Composite_2.Collapsed Nodes'", R=7.0)
+ref = dict(R("MaterialExpressionConstant_1"), Expression={
+    "ObjectName": "MaterialExpressionConstant'MaterialExpressionConstant_1'"})
+check("duplicate name at top level resolved", run(g, ref)[0], 3.0)
 
 # ------------------------------------------------------ renderer stand-ins
 check("EyeAdaptation is exposure 1", expr(lambda g: g.add("EyeAdaptation"))[0], 1.0)
@@ -907,6 +1010,14 @@ g = G()
 ca = g.add("CurveAtlasRowParameter", ParameterName="Curve", DefaultValue=3.0, InputTime=R(scalar(g, 0.5)),
            Atlas={"ObjectName": "CurveLinearColorAtlas'T_0.9_0.5_0.1'"})
 check("CurveAtlasRowParameter alpha", run(g, R(ca, 4))[0], 1.0)
+# a curve atlas is a table: Smart (cubic when magnified) blends a sixth of each neighbouring row in
+# (GrizzlyDemise's flames drew orange squares from the row above theirs)
+g = G()
+ca = g.add("CurveAtlasRowParameter", ParameterName="Curve", DefaultValue=3.0, InputTime=R(scalar(g, 0.5)),
+           Atlas={"ObjectName": "CurveLinearColorAtlas'T_0.9_0.5_0.1'"})
+_v, tr = run_val(g, R(ca, 0))
+check("CurveAtlasRowParameter samples its row Linear",
+      float([n.interpolation for n in tr.tree.nodes if n.bl_idname == "ShaderNodeTexImage"] == ["Linear"]), 1.0)
 g = G()
 ts = g.add("TextureSample", Texture={"ObjectName": "Texture2D'T_0.2_0.4_0.6'"})
 check("TextureSample RGBA keeps its alpha", run(g, R(ts, 5))[0], (0.2, 0.4, 0.6, 1.0))
@@ -937,6 +1048,18 @@ check("flat normal map is +Z", run(g, R(ts, 0))[0], (0.0, 0.0, 1.0))
 g = G()
 ts = g.add("TextureSample", Texture={"ObjectName": "Texture2D'T_0.6_0.3_0.9'"}, SamplerType="EMaterialSamplerType::SAMPLERTYPE_Normal")
 check("Normal sampler G output", run(g, R(ts, 2))[0], -0.4)
+# a sample of a texture object takes the object's sampler type (Hera rocks: a Color-typed sample of a
+# Normal texture object parameter, inside MF_Rocks_Layer, read raw lit the rock black)
+NORMAL_OBJ = dict(Texture={"ObjectName": "Texture2D'T_0.6_0.3_0.9'"}, SamplerType="EMaterialSamplerType::SAMPLERTYPE_Normal")
+g = G()
+to = g.add("TextureObjectParameter", ParameterName="Normal", **NORMAL_OBJ)
+ts = g.add("TextureSample", TextureObject=R(to))
+check("texture object's Normal sampler unpacks", run(g, R(ts, 5))[0], (0.2, -0.4, math.sqrt(1 - 0.2 ** 2 - 0.4 ** 2), 1.0))
+function("MF_SampleTexIn", lambda fg: fg.add("TextureSample", TextureObject=R(fn_input(fg, "Tex", "Texture2D"))))
+g = G()
+to = g.add("TextureObjectParameter", ParameterName="Normal", **NORMAL_OBJ)
+check("Normal texture object through a function unpacks", run(g, R(call(g, "MF_SampleTexIn", {"Tex": to}), 0))[0],
+      (0.2, -0.4, math.sqrt(1 - 0.2 ** 2 - 0.4 ** 2)))
 g = G()
 vp = vector(g, (0.1, 0.2, 0.3, 0.7))
 check("VectorParameter RGBA output", run(g, R(vp, 5))[0], (0.1, 0.2, 0.3, 0.7))
@@ -1439,6 +1562,353 @@ tree.links.new(a.outputs[0], b.inputs[1])
 go = tree.nodes.new("NodeGroupOutput"); tree.links.new(b.outputs[0], go.inputs[0])
 merge_duplicates(tree)
 check("settled: constant maths folds to the group output's own value", (count(tree, "ShaderNodeMath"), round(go.inputs[0].default_value, 4)), (0, 1.0))
+
+# a map-wide texture off a landscape (a scattered grass blade's biome mask): the game's sample mixed with the shared
+# MP Biome group's by its Painted, 0 until a painted terrain fills it (scatter_biomes); on a landscape, no group
+class MapEnv(TestEnv):
+    def __init__(self, entry, **over):
+        super().__init__(**over)
+        self.entry, self.probe, self._once = entry, None, {}
+
+    def once(self, key, make):
+        k = (self.tr.tree.as_pointer(), key)
+        if k not in self._once:
+            self._once[k] = make()
+        return self._once[k]
+
+    def world_position(self, camera_relative=False):
+        return self.tr.const(self.probe if self.probe is not None else (2.0e5, -1.0e5, 0.0), 3)
+
+
+for entry, want_groups in (({}, 1), ({"landscape_layers": []}, 0)):
+    g = G()
+    wp = g.add("WorldPosition")
+    uv = g.add("Saturate", Input=R(g.add("Add", A=R(g.add("Divide", A=R(wp, 0, "RG"), B=R(g.add("Constant", R=1.0e6)))),
+                                         B=R(g.add("Constant", R=0.5)))))
+    ts = g.add("TextureSampleParameter2D", ParameterName="BiomeTexture", Coordinates=R(uv),
+               Texture={"ObjectName": "Texture2D'T_0.75_0.25_0.5'"})
+    tree = bpy.data.node_groups.new("_test", "ShaderNodeTree")
+    env = MapEnv(entry)
+    tr = Translator(tree, env)
+    env.h[0] = tr
+    v = tr.material_output(g.save("M_%d" % g.id, R(ts)), "EmissiveColor")
+    biome = [n for n in tree.nodes if n.bl_idname == "ShaderNodeGroup" and n.node_tree.name.startswith("MP Biome")]
+    tag = "off a landscape" if not entry else "on a landscape"
+    check("map texture %s: MP Biome groups" % tag, len(biome), want_groups)
+    check("map texture %s: recorded" % tag, len(getattr(env, "map_textures", {})), want_groups)
+    check("map texture %s: the game's sample while unpainted" % tag, value(v), (0.75, 0.25, 0.5))
+
+
+# ... read inside a function, as a ground cover's layer colour lerps its biome tints (MF_Hera_Gravel_BiomeColor ->
+# MF_HeraBiomeMasks_Isolated -> MF_Hera_BiomeMasks): still one group, the game's sample while unpainted
+def _biome_mask(fg):
+    wp = fg.add("WorldPosition")
+    uv = fg.add("Saturate", Input=R(fg.add("Add", A=R(fg.add("Divide", A=R(wp, 0, "RG"), B=R(fg.add("Constant", R=1.0e6)))),
+                                           B=R(fg.add("Constant", R=0.5)))))
+    return fg.add("TextureSampleParameter2D", ParameterName="BiomeTexture", Coordinates=R(uv),
+                  Texture={"ObjectName": "Texture2D'T_0.75_0.25_0.5'"})
+
+
+function("F_BiomeMaskIn", _biome_mask)
+g = G()
+mix = g.add("LinearInterpolate", A=R(const3(g, (1.0, 0.0, 0.0))), B=R(const3(g, (0.0, 0.0, 1.0))),
+            Alpha=R(call(g, "F_BiomeMaskIn", {}), 0, "R"))
+tree = bpy.data.node_groups.new("_test", "ShaderNodeTree")
+env = MapEnv({})
+tr = Translator(tree, env)
+env.h[0] = tr
+v = tr.material_output(g.save("M_%d" % g.id, R(mix)), "EmissiveColor")
+check("map texture in a function: recorded once", len(getattr(env, "map_textures", {})), 1)
+check("map texture in a function: the biome tint lerps by the game's sample while unpainted", value(v), (0.25, 0.0, 0.75))
+
+# biome names from the masks' named outputs (MF_HeraBiomeMasks_Isolated): each quarter split by one call, read
+# through a reroute; GoldenFall2 = R x G of quarter B, so G is Golden Fall 2 (a call read twice reads twice)
+from fpmp_baseline.material_porter.ue_graph import maptex  # noqa: E402
+from fpmp_baseline.material_porter.ue_graph.core import Graph  # noqa: E402
+
+g = G()
+split = {}
+for q in "ABCD":
+    fin = g.add("FunctionInput", Id="IN_" + q, InputName="TerrainMasks_Quad" + q)
+    split[q] = g.add("MaterialFunctionCall", FunctionInputs=[{"Input": R(g.add("Reroute", Input=R(fin)))}],
+                     MaterialFunction={"ObjectName": "MaterialFunction'BreakOutFloat4Components'"})
+outs = {"00_Chaparral": R(g.add("Saturate", Input=R(g.add("Add", A=R(split["A"], 0), B=R(scalar(g, 0.0)))))),
+        "01_RedWoods": R(split["A"], 1), "02_Archipelago": R(split["A"], 2),
+        "03_Desert": R(g.add("Multiply", A=R(split["A"], 3), B=R(g.add("OneMinus", Input=R(g.add(
+            "Max", A=R(split["B"], 2), B=R(split["B"], 3))))))),
+        "04_GoldenFall": R(split["B"], 0), "05_GoldenFall2": R(g.add("Multiply", A=R(split["B"], 0), B=R(split["B"], 1))),
+        "06_NarrowFlea": R(split["B"], 2), "07_AxisMandate": R(split["B"], 3), "08_IslandA": R(split["C"], 0),
+        "13_None": R(split["D"], 1)}
+for i, (name, src) in enumerate(outs.items()):
+    g.add("FunctionOutput", Id="OUT_%d" % i, OutputName=name, A=src)
+named = maptex._named(Graph(g.save("MF_BiomeNames_%d" % g.id)))
+got = [named.get(k) for k in (("A", 0), ("A", 1), ("A", 2), ("A", 3), ("B", 0), ("B", 1), ("B", 2), ("B", 3), ("C", 0),
+                               ("D", 1))]
+check("biome names: Hera's masks by quarter and channel %s" % got, float(got == [
+    "Chaparral", "Red Woods", "Archipelago", "Desert", "Golden Fall", "Golden Fall 2", "Narrow Flea", "Axis Mandate",
+    "Island A", None]), 1.0)
+
+# ------------------------------------------------------------ foliage base darkening (build.assemble + foliage.panel)
+from fpmp_baseline.material_porter import build, foliage  # noqa: E402
+
+grass_entry = {"asset": {"ShadingModel": "EMaterialShadingModel::MSM_FromMaterialExpression", "TwoSided": True,
+                         "BlendMode": "EBlendMode::BLEND_Masked", "ShadingModels": {"ShadingModelField": 6}}}
+for name, entry, want in (
+        ("grass (picks lit or subsurface, two-sided, masked)", grass_entry, True),
+        ("tree bark (lit, compiles subsurface, two-sided)", {"asset": {"ShadingModel": "MSM_DefaultLit", "TwoSided": True,
+                                                                      "ShadingModels": {"ShadingModelField": 4}}}, True),
+        ("one-sided foliage model", {"asset": {"ShadingModel": "MSM_TwoSidedFoliage"}}, True),
+        ("a one-sided prop that compiles subsurface", {"asset": {"ShadingModel": "MSM_FromMaterialExpression",
+                                                                "ShadingModels": {"ShadingModelField": 86}}}, False),
+        ("translucent two-sided subsurface", {"asset": {"ShadingModel": "MSM_Subsurface", "TwoSided": True,
+                                                        "BlendMode": "BLEND_Translucent"}}, False),
+        ("a cosmetic's two-sided subsurface", {"asset": {"ShadingModel": "MSM_Subsurface", "TwoSided": True},
+                                               "cosmetic": True}, False),
+        ("two-sided lit", {"asset": {"ShadingModel": "MSM_DefaultLit", "TwoSided": True}}, False)):
+    check("foliage: " + name, float(build.settings(entry)["foliage"]), float(want))
+
+
+def foliage_built(entry, colour=(0.4, 0.6, 0.2), specular=0.3):
+    """(material, group node) for a material of Base Color `colour` and Specular `specular` built as build_one does."""
+    nodes = [{"Type": "MaterialExpressionVectorParameter", "Name": "Bc", "Properties": {"ParameterName": "bc",
+              "DefaultValue": {"R": colour[0], "G": colour[1], "B": colour[2], "A": 1.0}}},
+             {"Type": "MaterialExpressionScalarParameter", "Name": "Sp", "Properties": {"ParameterName": "sp", "DefaultValue": specular}},
+             {"Type": "MaterialEditorOnlyData", "Name": "MaterialEditorOnlyData_0",
+              "Properties": {"BaseColor": R("Bc"), "Specular": R("Sp")}}]
+    path = os.path.join(TMP, "M_foliage_%d.json" % len(bpy.data.materials))
+    json.dump(nodes, open(path, "w", encoding="utf-8"))
+    mat = bpy.data.materials.new("foliage")
+    mat.node_tree.nodes.clear()
+    root = bpy.data.node_groups.new(mat.name, "ShaderNodeTree")
+    env = TestEnv()
+    tr = Translator(root, env)
+    env.h[0] = tr
+    vals = tr.material_attributes(path, build.CARRIED)
+    build.assemble(tr, mat, vals, build.settings(dict(entry, name="foliage")))
+    build._rvt_output(tr, entry, vals)
+    foliage.panel(root)
+    node = mat.node_tree.nodes.new("ShaderNodeGroup")
+    node.node_tree = root
+    return mat, node
+
+
+def bsdf_in(node, name):
+    bsdf = next(n for n in node.node_tree.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled")
+    return ev_input(bsdf.inputs[name], (node,))
+
+
+mat, node = foliage_built(grass_entry)
+items = node.node_tree.interface.items_tree
+panel = next((it for it in items if it.item_type == 'PANEL' and it.name == foliage.PANEL), None)
+check("foliage: a Foliage panel", float(panel is not None), 1.0)
+check("foliage: its three inputs in it", float(panel is not None and [it.name for it in panel.interface_items] == list(foliage.INPUTS)), 1.0)
+check("foliage: none at the root", float(any(it.name in foliage.INPUTS and it.parent != panel for it in items)), 0.0)
+check("foliage: darkening off by default", node.inputs[foliage.DARKENING].default_value, 0.0)
+ATTRIBUTES.update({"mp_part_bounds_min": (-1.0, -1.0, -0.5), "mp_part_bounds_max": (1.0, 1.0, 2.0)})
+game = {n.label: n for n in node.node_tree.nodes if n.label in ("foliage base", "foliage base specular")}
+for z in (-0.5, 0.0, 0.7, 2.0):
+    TEXCOORD["Object"] = (0.0, 0.0, z)
+    check("foliage: default leaves the game's colour exactly at z %g" % z, bsdf_in(node, "Base Color"),
+          ev_input(game["foliage base"].inputs[6], (node,)), tol=0.0)
+    check("foliage: default leaves the game's specular exactly at z %g" % z, bsdf_in(node, "Specular IOR Level"),
+          ev_input(game["foliage base specular"].inputs[2], (node,)), tol=0.0)
+check("foliage: the game's colour", bsdf_in(node, "Base Color"), (0.4, 0.6, 0.2))
+tint = tuple(node.inputs[foliage.TINT].default_value)[:3]
+node.inputs[foliage.DARKENING].default_value = 1.0
+TEXCOORD["Object"] = (0.0, 0.0, 0.0)
+check("foliage: the foot takes the tint", bsdf_in(node, "Base Color"), tuple(c * t for c, t in zip((0.4, 0.6, 0.2), tint)))
+grey = 0.2126 * tint[0] + 0.7152 * tint[1] + 0.0722 * tint[2]
+check("foliage: ...and its specular the tint's brightness", bsdf_in(node, "Specular IOR Level"), 0.3 * grey)
+TEXCOORD["Object"] = (0.0, 0.0, 2.0)
+check("foliage: the top keeps its colour", bsdf_in(node, "Base Color"), (0.4, 0.6, 0.2))
+TEXCOORD["Object"] = (0.0, 0.0, 0.5)
+node.inputs[foliage.DARKENING].default_value = 0.5
+node.inputs[foliage.HEIGHT].default_value = 0.5
+# a quarter of the way up, half of Base Height: weight 0.5 x 0.5
+check("foliage: a linear fade to Base Height, x Base Darkening",
+      bsdf_in(node, "Base Color"), tuple(c * (1.0 + 0.25 * (t - 1.0)) for c, t in zip((0.4, 0.6, 0.2), tint)))
+ATTRIBUTES.clear()
+TEXCOORD.update({"Object": (0.0, 0.0, 5.0), "Generated": (0.5, 0.5, 0.0)})
+node.inputs[foliage.HEIGHT].default_value = 1.0
+check("foliage: a mesh without part bounds fades by its generated height",
+      bsdf_in(node, "Base Color"), tuple(c * (1.0 + 0.5 * (t - 1.0)) for c, t in zip((0.4, 0.6, 0.2), tint)))
+TEXCOORD.clear()
+mat, node = foliage_built({"asset": {"ShadingModel": "MSM_DefaultLit"}})
+check("foliage: none on a lit one-sided material",
+      float(any(it.name in foliage.INPUTS + (foliage.PANEL,) for it in node.node_tree.interface.items_tree)), 0.0)
+
+# rvt: RVT samples read the file's bake (material_porter/rvt.py), feature switches take Yes where it's baked
+def rvt_bake_one(colour):
+    """A 1 x 1 bake over (0, 0)..(10, 10) m: the evaluator reads pixel 0 wherever it's inside."""
+    from fpmp_baseline.material_porter import rvt
+    im = rvt.image()
+    im.scale(1, 1)
+    im.pixels[:] = colour
+    im.pack()       # as bake() does: it survives a reload
+    bpy.context.scene[rvt.KEY] = json.dumps({"bounds": [0.0, 0.0, 10.0, 10.0], "size": [1, 1], "objects": []})
+    rvt._aim(rvt.lookup_group(), [0.0, 0.0, 10.0, 10.0])
+    return tuple(im.pixels[:3])
+
+
+def rvt_tests():
+    from fpmp_baseline.material_porter import rvt
+    from fpmp_baseline.material_porter.env import MaterialEnv
+
+    class RvtEnv(TestEnv):
+        writes_rvt, probe = False, None
+        runtime_virtual_texture = MaterialEnv.runtime_virtual_texture
+        virtual_texture_available = MaterialEnv.virtual_texture_available
+        virtual_texture_valid = MaterialEnv.virtual_texture_valid
+        _rvt = MaterialEnv._rvt
+
+        def once(self, key, make):
+            return make()
+
+        @property
+        def foliage(self):
+            return self.over.get("foliage", True)
+
+    def rvt_run(g, out, **over):
+        tree = bpy.data.node_groups.new("_test", "ShaderNodeTree")
+        env = RvtEnv(**over)
+        tr = Translator(tree, env)
+        env.h[0] = tr
+        return value(tr.material_output(g.save("M_%d" % g.id, out), "EmissiveColor")), tr
+
+    bake_one = rvt_bake_one
+
+    def sample(g, pos):
+        return g.add("RuntimeVirtualTextureSample", WorldPosition=R(const3(g, pos)))
+
+    def switch(g):
+        return g.add("VirtualTextureFeatureSwitch", No=R(scalar(g, 3.0)), Yes=R(scalar(g, 7.0)))
+
+    bake_one((0.2, 0.4, 0.1, 1.0))
+    g = G()
+    got, _ = rvt_run(g, sample(g, (250.0, -250.0, 0.0)))
+    check("rvt: a sample reads the bake's Base Color", got, (0.2, 0.4, 0.1), tol=1.0 / 255)    # a byte image
+    g = G()
+    check("rvt: feature switch takes Yes where baked", rvt_run(g, switch(g), world=(250.0, -250.0, 0.0))[0], 7.0)
+    g = G()
+    check("rvt: ...and No outside the bake", rvt_run(g, switch(g), world=(5000.0, 5000.0, 0.0))[0], 3.0)
+    g = G()
+    got, _ = rvt_run(g, sample(g, (5000.0, 5000.0, 0.0)))
+    check("rvt: outside the bake, neutral grey", got, (0.5, 0.5, 0.5))
+
+    path = os.path.join(TMP, "rvt_saved.blend")
+    bpy.ops.wm.save_as_mainfile(filepath=path, copy=True)
+    bpy.ops.wm.open_mainfile(filepath=path)
+    check("rvt: a saved bake reloads", float(rvt.baked().get("bounds") == [0.0, 0.0, 10.0, 10.0]), 1.0)
+    g = G()
+    check("rvt: ...and reads again after reload",
+          rvt_run(g, switch(g), world=(250.0, -250.0, 0.0))[0], 7.0)
+    g = G()
+    check("rvt: ...its colour too", rvt_run(g, sample(g, (250.0, -250.0, 0.0)))[0], (0.2, 0.4, 0.1), tol=1.0 / 255)
+
+    # scope: only foliage reading the bake's colour alone takes Yes (rocks, trees, props read its height too)
+    def read_switch(g, out):
+        rd = g.add("RuntimeVirtualTextureSample", WorldPosition=R(const3(g, (250.0, -250.0, 0.0))))
+        return g.add("VirtualTextureFeatureSwitch", No=R(const3(g, (0.9, 0.9, 0.9))), Yes=R(rd, out))
+    g = G()
+    got, _ = rvt_run(g, read_switch(g, 0), world=(250.0, -250.0, 0.0))
+    check("rvt scope: a foliage switch reading BaseColor blends", got, (0.2, 0.4, 0.1), tol=1.0 / 255)
+    g = G()
+    got, _ = rvt_run(g, read_switch(g, 4), world=(250.0, -250.0, 0.0))
+    check("rvt scope: a switch reading WorldHeight keeps No", got, (0.9, 0.9, 0.9))
+    g = G()
+    got, _ = rvt_run(g, read_switch(g, 0), world=(250.0, -250.0, 0.0), foliage=False)
+    check("rvt scope: a lit prop keeps No", got, (0.9, 0.9, 0.9))
+    ATTRIBUTES["mp_ground_off"] = 1.0
+    g = G()
+    got, _ = rvt_run(g, read_switch(g, 0), world=(250.0, -250.0, 0.0))
+    check("ground: Off forces No on an RVT reader", got, (0.9, 0.9, 0.9))
+    ATTRIBUTES.clear()
+
+    rvt.clear()
+    g = G()
+    check("rvt: no bake, the No branch", rvt_run(g, switch(g), world=(250.0, -250.0, 0.0))[0], 3.0)
+
+    # a landscape reads what it writes itself, never the bake
+    bake_one((0.2, 0.4, 0.1, 1.0))
+    g = G()
+    own = const3(g, (0.7, 0.6, 0.5))
+    g.add("RuntimeVirtualTextureOutput", BaseColor=R(own))
+    rd = sample(g, (250.0, -250.0, 0.0))
+    tree = bpy.data.node_groups.new("_test", "ShaderNodeTree")
+    env = RvtEnv()
+    tr = Translator(tree, env)
+    env.h[0] = tr
+    vals = tr.material_attributes(_with_base(g, rd))
+    check("rvt: a writer reads its own output", value(vals["BaseColor"]), (0.7, 0.6, 0.5))
+    check("rvt: ...without the bake's group", float(any(n.bl_idname == "ShaderNodeGroup" and n.node_tree is not None
+                                                         and n.node_tree.name == rvt.NAME for n in tree.nodes)), 0.0)
+
+
+def _with_base(g, src):
+    """The graph saved with src on its BaseColor pin (a plain-pin material)."""
+    return g.save("M_%d" % g.id, src, pin="BaseColor")
+
+
+rvt_tests()
+
+
+# a landscape without an RVT output (Hera's proxies, custom terrain) still gives the bake its finished Base Color
+def rvt_written(entry):
+    from fpmp_baseline.material_porter import rvt
+    mat, node = foliage_built(entry, colour=(0.3, 0.2, 0.1))
+    out = next(n for n in node.node_tree.nodes if n.bl_idname == "NodeGroupOutput")
+    sock = out.inputs.get(rvt.SOCKET)
+    return None if sock is None or not sock.is_linked else ev_input(sock, (node,))
+
+
+check("rvt: a landscape writes its Base Color", rvt_written({"landscape_layers": {"Gravel": "Attribute1.R"}}),
+      (0.3, 0.2, 0.1))
+check("rvt: ...a custom terrain too", rvt_written({"landscape_images": {"Gravel": "Weightmap1.R"}}), (0.3, 0.2, 0.1))
+check("rvt: a prop writes nothing", float(rvt_written({}) is None), 1.0)
+
+# ground: the opt-in Ground Blend on foliage that doesn't read the RVT (ground.py), at the plant's root
+def ground_tests():
+    from fpmp_baseline.material_porter import ground
+    g = rvt_bake_one((0.3, 0.25, 0.2, 1.0))
+    base = (0.1, 0.2, 0.05)
+    k = (0.2126 * base[0] + 0.7152 * base[1] + 0.0722 * base[2]) / 0.25
+    whole = tuple(c * k for c in g)
+    mat, node = foliage_built(grass_entry, colour=base)
+    # Hera Grass01 blades' mean brightness (land_ground scenario: 0.121 to 0.134)
+    check("ground: Ground Reference defaults to Hera grass' brightness", node.inputs[ground.REFERENCE].default_value,
+          0.12, tol=1e-6)
+    node.inputs[ground.REFERENCE].default_value = 0.25
+    OBJECT_INFO["Location"] = (2.5, 2.5, 0.0)        # the root over the bake
+    TEXCOORD["Generated"] = (0.5, 0.5, 0.0)          # no part bounds: height 0 at the foot
+    check("ground: Game on a non-RVT material leaves base", bsdf_in(node, "Base Color"), base)
+    ATTRIBUTES.update(ground.values("On", "Whole blade", 1.0))
+    check("ground: On, whole blade, strength 1", bsdf_in(node, "Base Color"), whole, tol=1e-3)
+    ATTRIBUTES.update(ground.values("On", "Whole blade", 0.5))
+    check("ground: strength 0.5 halves the lerp", bsdf_in(node, "Base Color"),
+          tuple(b + (w - b) * 0.5 for b, w in zip(base, whole)), tol=1e-3)
+    ATTRIBUTES.update(ground.values("On", "Root to tip", 1.0))
+    check("ground: root to tip, the foot takes the ground", bsdf_in(node, "Base Color"), whole, tol=1e-3)
+    TEXCOORD["Generated"] = (0.5, 0.5, 1.0)
+    check("ground: root to tip keeps the tip", bsdf_in(node, "Base Color"), base, tol=1e-3)
+    ATTRIBUTES.update(ground.values("On", "Whole blade", 1.0))
+    OBJECT_INFO["Location"] = (50.0, 50.0, 0.0)
+    check("ground: outside the bake leaves base", bsdf_in(node, "Base Color"), base)
+    ATTRIBUTES.update(ground.values("Off", "Whole blade", 1.0))
+    OBJECT_INFO["Location"] = (2.5, 2.5, 0.0)
+    check("ground: Off leaves base", bsdf_in(node, "Base Color"), base)
+    # a pale blade over the reference scales the ground by 2 at most (0.9 / 0.12 would be 7.5)
+    mat, node = foliage_built(grass_entry, colour=(0.9, 0.9, 0.9))
+    ATTRIBUTES.update(ground.values("On", "Whole blade", 1.0))
+    check("ground: a pale blade's scale clamps at 2", bsdf_in(node, "Base Color"), tuple(c * 2.0 for c in g), tol=1e-3)
+    mat, node = foliage_built({"asset": {"ShadingModel": "MSM_DefaultLit"}})
+    check("ground: none on a lit one-sided material",
+          float(any(it.name == ground.REFERENCE for it in node.node_tree.interface.items_tree)), 0.0)
+    ATTRIBUTES.clear()
+    TEXCOORD.clear()
+    OBJECT_INFO.clear()
+
+
+ground_tests()
 
 check("no graph file written twice", REWRITTEN[0], 0)
 

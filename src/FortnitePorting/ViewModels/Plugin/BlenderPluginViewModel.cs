@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
@@ -8,6 +7,8 @@ using FluentAvalonia.UI.Controls;
 using FortnitePorting.Models.Information;
 using FortnitePorting.Models.Plugin;
 using FortnitePorting.Services;
+using FortnitePorting.Shared.Extensions;
+using Newtonsoft.Json;
 using Serilog;
 
 namespace FortnitePorting.ViewModels.Plugin;
@@ -16,11 +17,32 @@ public partial class BlenderPluginViewModel : PluginInstallationViewModelBase<Bl
 {
     [ObservableProperty] private bool _completedFirstInstall;
 
+    [ObservableProperty] private bool _autoLaunchBlender = true;
+
+    [JsonIgnore]
+    public BlenderInstallation? DefaultInstallation => Installations.FirstOrDefault(installation => installation.IsDefault);
+
+    [JsonIgnore]
+    public string? DefaultBlenderPath => DefaultInstallation?.BlenderPath;
+
     protected override DirectoryInfo PluginWorkingDirectory => BlenderInstallation.PluginWorkingDirectory;
 
     protected override bool TrySyncVersion(BlenderInstallation installation) => installation.SyncExtensionVersion();
 
     protected override void Uninstall(BlenderInstallation installation) => installation.Uninstall();
+
+    public override async Task RemoveInstallation(BlenderInstallation installation)
+    {
+        await TaskService.Run(() =>
+        {
+            var wasDefault = installation.IsDefault;
+            Uninstall(installation);
+            Installations.Remove(installation);
+
+            if (wasDefault && Installations.Count > 0)
+                Installations[0].IsDefault = true;
+        });
+    }
 
     public override async Task AddInstallation()
     {
@@ -102,11 +124,11 @@ public partial class BlenderPluginViewModel : PluginInstallationViewModelBase<Bl
         }
 
         if (blenderVersion < BlenderInstallation.MinimumModernVersion)
-        { 
+        {
             Info.Dialog("Legacy Blender Plugin",
             "You are using a legacy version of the blender plugin. Modern V4 features such as the modular material system will not be supported.",
                 canClose: false,
-                buttons: [ 
+                buttons: [
                     new DialogButton
                     {
                         Text = "I Understand",
@@ -116,7 +138,7 @@ public partial class BlenderPluginViewModel : PluginInstallationViewModelBase<Bl
             );
         }
 
-        if (TryGetBlenderProcess(blenderPath, out var blenderProcess))
+        if (ProcessExtensions.GetRunningProcess(blenderPath) is { } blenderProcess)
         {
             Info.Message("Failed to Add Blender Installation",
                 $"This version of Blender is currently open. Please close it and re-add the installation.",
@@ -131,6 +153,8 @@ public partial class BlenderPluginViewModel : PluginInstallationViewModelBase<Bl
         var installation = new BlenderInstallation(blenderPath);
 
         Installations.Add(installation);
+        if (Installations.Count == 1)
+            installation.IsDefault = true;
 
         await TaskService.RunAsync(() =>
         {
@@ -163,7 +187,7 @@ public partial class BlenderPluginViewModel : PluginInstallationViewModelBase<Bl
                 continue;
             }
 
-            if (TryGetBlenderProcess(installation.BlenderPath, out var blenderProcess))
+            if (ProcessExtensions.GetRunningProcess(installation.BlenderPath) is { } blenderProcess)
             {
                 // MP: an open Blender's plugin is updated too; it loads it on restart
                 if (installation.PluginDiffers())
@@ -202,41 +226,5 @@ public partial class BlenderPluginViewModel : PluginInstallationViewModelBase<Bl
                 Info.Message("Blender Extension", $"Successfully updated the Blender {installation.BlenderVersion} extension from {previousVersion} to {currentVersion}");
             }
         }
-    }
-
-    private static bool TryGetBlenderProcess(string path, [MaybeNullWhen(false)] out Process process)
-    {
-        // Match a running Blender to the selected executable. The old implementation used
-        // Process.GetProcessesByName("blender") + path.Replace("/", "\\") — both Windows-isms that
-        // made this ALWAYS return false on macOS (the process is "Blender", paths use "/"). The effect:
-        // FortnitePorting never noticed Blender was already open, silently synced the plugin into a
-        // running Blender that won't load it until it's restarted, and left the user with "install the
-        // plugin" on export and nothing in Blender. Match by executable name and, when the OS lets us
-        // read it, the exact module path.
-        var exeName = System.IO.Path.GetFileNameWithoutExtension(path);
-        process = Process.GetProcesses().FirstOrDefault(candidate =>
-        {
-            try
-            {
-                if (!candidate.ProcessName.Equals(exeName, System.StringComparison.OrdinalIgnoreCase))
-                    return false;
-                try
-                {
-                    return candidate.MainModule?.FileName is not { } fileName
-                           || string.Equals(fileName, path, System.StringComparison.OrdinalIgnoreCase);
-                }
-                catch
-                {
-                    // MainModule isn't always readable for other processes on macOS; the name match
-                    // is enough to know a Blender is open and warn the user to close it.
-                    return true;
-                }
-            }
-            catch
-            {
-                return false;
-            }
-        });
-        return process is not null;
     }
 }

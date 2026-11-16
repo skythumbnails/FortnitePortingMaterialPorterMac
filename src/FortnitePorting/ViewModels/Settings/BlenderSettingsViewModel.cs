@@ -15,6 +15,7 @@ namespace FortnitePorting.ViewModels.Settings;
 public partial class BlenderSettingsViewModel : BaseExportSettings
 {
     public bool IsTastyRig => RigType == ERigType.Tasty;
+    public bool IsOfficialRig => RigType == ERigType.Official;     // MP
     
     // General
     [ObservableProperty] private bool _scaleDown = true;
@@ -22,14 +23,17 @@ public partial class BlenderSettingsViewModel : BaseExportSettings
     [ObservableProperty] private bool _importAt3DCursor = false;
     
     // Armature
-    [ObservableProperty, NotifyPropertyChangedFor(nameof(IsTastyRig))] private ERigType _rigType = ERigType.Default;
+    [ObservableProperty, NotifyPropertyChangedFor(nameof(IsTastyRig)), NotifyPropertyChangedFor(nameof(IsOfficialRig))] private ERigType _rigType = ERigType.Default;     // MP: IsOfficialRig
     [ObservableProperty] private bool _mergeArmatures = true;
     [ObservableProperty] private bool _reorientBones = false;
     [ObservableProperty] private bool _importSockets = true;
     [ObservableProperty] private bool _importVirtualBones = false;
     [ObservableProperty] private bool _useDynamicBoneShape = true;
     [ObservableProperty] private float _boneLength = 4.0f;
-    
+    // MP: the official rig's extra hand controls (curl, spread, palm cup), not part of Epic's rig
+    [ObservableProperty] private bool _officialRigHandControls = false;
+    [ObservableProperty] private bool _faceBoard = true;     // MP: off keeps a regular character's face bones bare
+
     // Mesh
     [ObservableProperty] private int _targetLOD = 0;
     [ObservableProperty] private EPolygonType _polygonType;
@@ -53,11 +57,10 @@ public partial class BlenderSettingsViewModel : BaseExportSettings
     [ObservableProperty] private float _profileColour = 0.5f;
     [ObservableProperty] private float _furSubsurfaceIntensity = 1.0f;
     [ObservableProperty] private float _furSubsurfaceScale = 1.0f;
-    
     [ObservableProperty] private bool _useForgeMaterials = false;
     [ObservableProperty] private string _forgeBlendPath = string.Empty;
     [ObservableProperty] private EForgeScope _forgeScope = EForgeScope.Everything;
-
+    
     // Texture
     [ObservableProperty] private ETextureImportMethod _textureImportMethod = ETextureImportMethod.Data;
     

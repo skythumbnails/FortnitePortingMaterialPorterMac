@@ -1,19 +1,39 @@
 using System;
+using System.Linq;
 using System.Threading.Tasks;
 using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using FortnitePorting.Application;
 using FortnitePorting.MaterialPorter;
+using FortnitePorting.Models.Map;
 
 namespace FortnitePorting.ViewModels;
 
-/// <summary>A UEFN island opened by its map code (owner builds only, Fork.Islands).</summary>
+/// <summary>A UEFN island opened by its map code (with UEFN access, Fork.Islands).</summary>
 // The user's key tool gets the island's key from Epic (a sign-in page opens when it asks); the key is kept with
 // Material Porter's (never shown or logged), the island Fortnite downloaded is mounted, and the map list reloads.
 public partial class MapViewModel
 {
     public bool CanUnlockIslands => Fork.Islands;
+
+    // A new season's island, first in the list, until FP's online list has it.
+    private async Task AddGameMapsAsync()
+    {
+        foreach (var info in await GameMaps.ReadAsync(_ueParse.Provider))
+        {
+            var file = _ueParse.Provider.FixPath(info.MapPath + ".umap");
+            if (!info.IsValid() || Maps.Any(m => _ueParse.Provider.FixPath(m.MapInfo.MapPath + ".umap").Equals(file, StringComparison.OrdinalIgnoreCase))) continue;
+            Maps.Insert(0, new WorldPartitionMap(info) { SnapCells = true });
+        }
+    }
+
+    // Local UEFN projects' maps: listed with the others, and re-read on request.
+    partial void AddProjectMaps();
+    partial void RefreshProjectList();
+
+    [RelayCommand]
+    public void RefreshProjects() => RefreshProjectList();
 
     [ObservableProperty] private string _islandCode = string.Empty;
     [ObservableProperty] private string _islandStatus = string.Empty;

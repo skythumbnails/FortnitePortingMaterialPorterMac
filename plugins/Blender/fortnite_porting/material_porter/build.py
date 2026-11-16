@@ -5,20 +5,25 @@ A material is one group node (its graph, the "root" node group) into the Materia
 the parameters are that node's inputs, holding the instance's values (env.MaterialEnv)."""
 import hashlib
 import json
+import time
 
 import bpy
 
-from . import layout
+from . import foliage, ground, layout, params
 from .app_client import AppClient
 from . import world
 from .env import MaterialEnv, fit_socket, match_names
 from .nodelib import SECTION_KEY
 from .ue_graph import BOUNDS_CENTRE, BOUNDS_MAX, BOUNDS_MIN, PART_BOUNDS_MAX, PART_BOUNDS_MIN, HEAD_SOCKET, CARRIED, SHADING_MODELS, Translator, Val, merge_duplicates
+from .ue_graph.edits import Placing, holds
+from .ue_graph import twins
 
 PREFIX = "MP "            # prefix of built materials: "MP MI_Foo"
 KEY_PATH = "mp_path"      # game object the material translates
+KEY_SWITCHES = "mp_switches"      # the material's static switches as built, {name: on} (JSON): the panel's features
+KEY_MAPS = "mp_map_textures"      # map-wide textures found on a custom landscape, {parameter: {texture, rects}} (JSON)
 KEY_REV = "mp_rev"        # build revision that made it (older ones are rebuilt, not reused)
-BUILD_REVISION = 71       # bump when a builder change should rebuild existing materials
+BUILD_REVISION = 93  # bump when a builder change should rebuild existing materials
 KEY_REPLACES = "mp_replaces"
 KEY_FP = "mp_fp"          # function group fingerprint, for sharing groups
 KEY_VARIANT = "mp_variant"  # hash of a style's parameter values over the instance
@@ -61,12 +66,16 @@ def settings(entry):
     """Blend mode, shading model and the rest: instance overrides, else the master's asset, else UE's defaults."""
     asset, over = entry.get("asset") or {}, entry.get("overrides") or {}
     pick = lambda k, d: over.get(k, asset.get(k, d))
+    blend, shading = _enum(pick("BlendMode", None), "BLEND_Opaque"), _enum(pick("ShadingModel", None), "MSM_DefaultLit")
+    models, two_sided = _models(asset.get("ShadingModels")), bool(pick("TwoSided", False))
     return {
-        "blend": _enum(pick("BlendMode", None), "BLEND_Opaque"),
-        "shading": _enum(pick("ShadingModel", None), "MSM_DefaultLit"),
+        "blend": blend,
+        "shading": shading,
         # shading models it compiles (UE's ShadingModels; None if the app doesn't say)
-        "models": _models(asset.get("ShadingModels")),
-        "two_sided": bool(pick("TwoSided", False)),
+        "models": models,
+        "two_sided": two_sided,
+        # grass, leaves, bushes, trees: get the Foliage panel's base darkening
+        "foliage": foliage.is_foliage(shading, models, two_sided, blend, entry),
         "clip": float(pick("OpacityMaskClipValue", 0.3333)),
         "tangent_normal": bool(asset.get("bTangentSpaceNormal", True)),
         # how a lit translucent material is lit (None if the app doesn't say: as a surface)
@@ -108,6 +117,12 @@ def assemble(tr, mat, a, s):
                 else "MSM_DefaultLit"
         # the water medium comes from the graph's SingleLayerWaterMaterialOutput
         water = shading == "MSM_SingleLayerWater" and "WaterAbsorption" in a
+        if s.get("foliage") and tr.tree != mat.node_tree and a.get("BaseColor") is not None \
+                and a.get("Specular") is not None:
+            if not getattr(tr.env, "rvt_blended", False):
+                # (a material that reads the RVT takes the ground its own way: statics.virtual_texture_blends)
+                a["BaseColor"] = ground.blend(tr, a["BaseColor"])
+            a["BaseColor"], a["Specular"] = foliage.darken(tr, a["BaseColor"], a["Specular"])
 
         # UE lights translucent materials from the translucency volume: diffuse only (no specular; Metallic only darkens).
         # Lit per vertex or without direction, the Normal is unused (smoke sprites' sphere normals would shade each puff as a ball).
@@ -525,6 +540,22 @@ def _with_alpha(tr, surface, alpha):
     return Val(mix.outputs[0], 3)
 
 
+def _rvt_output(tr, entry, vals):
+    """A material that writes the runtime virtual texture: its Base Color pin as the root's output rvt.SOCKET, shown
+    to rvt.bake() by an AOV (_material_node), which also keeps it from pruning."""
+    colour = tr.rvt_base_color()
+    if colour is None and any(entry.get(k) for k in ("landscape_layers", "landscape_world", "landscape_images")):
+        # a landscape without an RVT output (Hera's proxies, custom terrain): its finished Base Color
+        colour = vals.get("BaseColor")
+    if colour is None:
+        return
+    from .rvt import SOCKET
+    with tr.at("Output"):
+        tr.tree.interface.new_socket(SOCKET, in_out='OUTPUT', socket_type='NodeSocketColor')
+        out = next(n for n in tr.tree.nodes if n.bl_idname == "NodeGroupOutput")
+        tr.link(tr.as3(colour), out.inputs[SOCKET])
+
+
 def _material_node(mat, root, label, values, width):
     """The material's tree: the group node with the parameter values in its sockets, feeding the Material Output."""
     tree = mat.node_tree
@@ -543,6 +574,13 @@ def _material_node(mat, root, label, values, width):
         tree.links.new(node.outputs["Thickness"], out.inputs["Thickness"])
     if "Displacement" in node.outputs:
         tree.links.new(node.outputs["Displacement"], out.inputs["Displacement"])
+    from .rvt import AOV, SOCKET
+    if SOCKET in node.outputs:
+        aov = tree.nodes.new("ShaderNodeOutputAOV")
+        aov.aov_name = AOV
+        aov.location = (0.0, -200.0)
+        aov[SECTION_KEY] = ""
+        tree.links.new(node.outputs[SOCKET], aov.inputs["Color"])
     node.location = (-width - 60.0, 0.0)
     out.location = (0.0, 0.0)
     tree.nodes.active = node
@@ -610,7 +648,7 @@ def _fingerprint(tree, memo):
                 if prop.identifier == "node_tree" and v is not None:
                     # world and collection groups: one each per file, growing as materials ask for more
                     # (hashing their contents would make every group around them differ)
-                    world = "mp_path" in v or v.name.startswith(("MP World", "MP Collection"))
+                    world = "mp_path" in v or v.name.startswith(("MP World", "MP Collection", "MP Biome"))
                     v = "world:" + v.name if world else v.get(KEY_FP) or _fingerprint(v, memo)
                 elif prop.identifier == "image" and v is not None:
                     v = v.filepath or v.name
@@ -662,6 +700,7 @@ def begin_session():
     _KNOWN = None
     from . import env
     env._LOADED.clear()
+    twins.clear()
 
 
 def _known():
@@ -678,9 +717,10 @@ def _alive(g, fp):
         return False
 
 
-def share_groups(trees, owners=()):
+def share_groups(trees, owners=(), twins_of=None, drop=()):
     """Replace groups identical to one an earlier build made with that one (in these trees and the owners',
-    the only places a new group is used). Returns (how many were replaced, the ones kept)."""
+    the only places a new group is used). Returns (how many were replaced, the ones kept). twins_of gets
+    {replaced group's name: its twin}; `drop` goes in the same removal (ue_graph.twins' name holders)."""
     memo = {}
     known = _known()
     # innermost first: an outer group's fingerprint includes its inner groups
@@ -714,14 +754,16 @@ def share_groups(trees, owners=()):
             for n in users:
                 if n.node_tree == t:
                     n.node_tree = twin
+            if twins_of is not None:
+                twins_of[t.name] = twin
             gone.append(t)
             shared += 1
         else:
             t[KEY_FP] = fp
             known[fp] = t
             kept.append(t)
-    if gone:
-        bpy.data.batch_remove(gone)
+    if gone or drop:
+        bpy.data.batch_remove(gone + list(drop))
     return shared, kept
 
 
@@ -739,8 +781,8 @@ def _outputs_cover(twin, t, users):
 _OUTPUT_NODES = ("ShaderNodeOutputMaterial", "ShaderNodeOutputWorld", "ShaderNodeOutputLight", "ShaderNodeOutputAOV")
 
 
-def _live_outputs():
-    """{group: output identifiers a live node reads}, over the file: from every material, world and light output
+def _live_outputs(owners):
+    """{group: output identifiers a live node reads}: from the owners' (materials, worlds, lights) outputs
     through the group nodes they reach (a group node that is read at all reads all its inputs)."""
     used, live = {}, {}
 
@@ -769,7 +811,7 @@ def _live_outputs():
             for l in links:
                 stack.append((l.from_node, l.from_socket.identifier))
         return grew
-    for owner in list(bpy.data.materials) + list(bpy.data.worlds) + list(bpy.data.lights):
+    for owner in owners:
         tree = getattr(owner, "node_tree", None)
         if tree is not None:
             walk(tree, [(n, None) for n in tree.nodes if n.bl_idname in _OUTPUT_NODES])
@@ -817,12 +859,17 @@ def prune_groups(names):
 
     Each group was built whole, so a later material's call shares it unless that call reads a dropped output
     (share_groups then keeps that call's own copy)."""
+    from .bundles import in_scope, scope
     made = [g for g in (bpy.data.node_groups.get(n) for n in names) if g is not None]
     groups = [g for g in made if KEY_FP in g]
     roots = [g for g in made if KEY_FP not in g and bpy.data.materials.get(g.name) is not None]
+    # only trees that reach these groups can read or hold them
+    near = scope(made)
+    owners = in_scope(list(bpy.data.materials) + list(bpy.data.worlds) + list(bpy.data.lights), near)
+    trees = in_scope(list(bpy.data.node_groups), near) + [m.node_tree for m in in_scope(bpy.data.materials, near)]
     gone, touched = 0, set()
     for _ in range(16):
-        used = _live_outputs()
+        used = _live_outputs(owners)
         changed = False
         for g in groups:
             if g.users == 0:
@@ -850,7 +897,7 @@ def prune_groups(names):
             break
     # groups that only pass inputs on, or wrap one node, are replaced by that node (or the wire)
     for _ in range(8):
-        k = _inline_trivial([g for g in groups if g.users], touched)
+        k = _inline_trivial([g for g in groups if g.users], touched, trees)
         if not k:
             break
         gone += k
@@ -862,8 +909,8 @@ def prune_groups(names):
             t.interface.remove(it)
         if drop:
             _drop_empty_panels(t)
-            for m in bpy.data.materials:
-                if m.node_tree is not None and any(n.bl_idname == "ShaderNodeGroup" and n.node_tree == t for n in m.node_tree.nodes):
+            for m in owners:
+                if isinstance(m, bpy.types.Material) and any(n.bl_idname == "ShaderNodeGroup" and n.node_tree == t for n in m.node_tree.nodes):
                     gone += _drop_dead(m.node_tree, kinds=_ZONE_NODES)
             touched.add(t.name)
     unused = [g for g in groups if g.users == 0]
@@ -912,14 +959,14 @@ def _through(sock):
     return None
 
 
-def _inline_trivial(groups, touched):
+def _inline_trivial(groups, touched, trees):
     """Replace instances of a group that only passes inputs on (its work folded away) or holds one plain node
     (UE's Break Out Float3 Components: one Separate XYZ; a wrapper of one call) with the wire, or a copy of that node
     in the caller, where every value passed on keeps its type. Returns how many group nodes went."""
     from .ue_graph import _socket_value
     gone = 0
     users = {}
-    for t in list(bpy.data.node_groups) + [m.node_tree for m in bpy.data.materials if m.node_tree is not None]:
+    for t in trees:
         for n in t.nodes:
             if n.bl_idname == "ShaderNodeGroup" and n.node_tree is not None:
                 users.setdefault(n.node_tree.name, []).append((t, n))
@@ -1004,7 +1051,9 @@ def _inline_one(t, node, g, go, inner, socket_value):
             if k in _COPY_SKIP or prop.is_readonly and k != "node_tree":
                 continue
             try:
-                setattr(copy, k, getattr(inner, k))
+                v = getattr(inner, k)
+                if not holds(getattr(copy, k), v):
+                    setattr(copy, k, v)
             except (AttributeError, TypeError, ValueError):
                 pass
         copy.location, copy.parent = node.location, node.parent
@@ -1043,11 +1092,14 @@ class pruning:
 
     def __exit__(self, kind, _value, _tb):
         if kind is None:
+            t0 = time.perf_counter()
             self.gone = prune_groups([g.name for g in bpy.data.node_groups if g.name not in self.before])
             # then bundle their Material Attributes, module to module (bundles.py)
             from . import bundles
+            t1 = time.perf_counter()
             new = [g for g in bpy.data.node_groups if g.name not in self.before and KEY_FP in g]
             self.bundled = bundles.bundle_attributes(new, KEY_FP, _KNOWN)
+            self.seconds = (t1 - t0, time.perf_counter() - t1)     # for the import's log
         return False
 
 
@@ -1132,6 +1184,23 @@ def mark_shared_bounds(objects):
         o[BOUNDS_CENTRE] = [(a + b) * 0.5 for a, b in zip(o[BOUNDS_MIN], o[BOUNDS_MAX])]
 
 
+def _switches(tr, entry):
+    """Every static switch the material's graphs (its own and its functions') have, as built: the instance's value,
+    else the switch's default."""
+    from .ue_graph.core import T
+    found, set_by = {}, entry.get("switches") or {}
+    for t in [tr] + [ft.tr for ft in tr.functions.values()]:
+        for g in t.graphs.values():
+            if (declared := getattr(g, "mp_switches", None)) is None:     # graphs are shared: scanned once
+                declared = g.mp_switches = [
+                    (p["ParameterName"], p.get("DefaultValue", False)) for x in g.o
+                    if T(x) in ("StaticSwitchParameter", "StaticBoolParameter")
+                    and (p := x.get("Properties") or {}).get("ParameterName")]
+            for name, default in declared:
+                found[name] = bool(set_by.get(name, default))
+    return dict(sorted(found.items()))
+
+
 def build_one(entry, app, objects=(), make_env=None):
     """Build a Blender material for one bundle entry. Returns (material, notes).
 
@@ -1142,13 +1211,19 @@ def build_one(entry, app, objects=(), make_env=None):
         from .fallback import build_fallback
         return build_fallback(entry, app, objects, MaterialEnv, settings,
                               (PREFIX, KEY_PATH, KEY_REV, BUILD_REVISION, KEY_VARIANT))
+    from .ue_graph import core
+    core._DEPS.clear()      # groups may have been pruned since the last material
     mat = bpy.data.materials.new(PREFIX + entry["name"])
     tree = mat.node_tree
     tree.nodes.clear()
     root = bpy.data.node_groups.new(mat.name, "ShaderNodeTree")
     env = make_env(app, entry, objects) if make_env else MaterialEnv(app, entry, objects)
     env.root = root
+    env.foliage = settings(entry)["foliage"]
     tr = Translator(root, env)
+    if type(env) is MaterialEnv:
+        tr.twins = twins.Session(_known, KEY_FP)
+    tr.placing = Placing()
     env.h[0] = tr
     # a particle's material also moves its vertices (World Position Offset: a zero-width lightning strip
     # thickened towards the camera, a mesh bent along a spline)
@@ -1162,7 +1237,10 @@ def build_one(entry, app, objects=(), make_env=None):
         with tr.at("Output"):
             vals["EmissiveColor"] = tr.vmath('MAXIMUM', tr.as3(emissive), tr.const((0.0, 0.0, 0.0), 3), out_w=3)
     assemble(tr, mat, vals, settings(entry))
-    groups = [ft.tree for ft in tr.functions.values()]
+    _rvt_output(tr, entry, vals)
+    tr.placing.place()
+    recorded = twins.prepare(tr)
+    groups = [ft.tree for ft in tr.functions.values() if not ft.reused]
     # Merge alike nodes translation made (a texture per pin read, a group node per output of one call) and
     # drop nodes reaching no output. Runs before sharing, so twins compare folded groups, and before the
     # parameters are settled (a parameter only a dropped node read goes with it).
@@ -1171,11 +1249,17 @@ def build_one(entry, app, objects=(), make_env=None):
         merge_duplicates(t, memo)
     for t in groups:
         drop_unread_inputs(t)
+    recorded = twins.inputs_kept(recorded)
     values = env.finish_parameters()
     _subsurface_panel(root)
+    foliage.panel(root)
+    ground.panel(root)
     # twins of earlier materials' groups go first: laying out a group about to be thrown away
     # was half of all layout time
-    shared, kept = share_groups(groups, owners=[root])
+    reused = sum(ft.reused for ft in tr.functions.values())
+    twins_of = {}
+    shared, kept = share_groups(groups, owners=[root], twins_of=twins_of, drop=twins.held(tr))
+    shared += reused
     if LAZY_LAYOUT:
         for t in kept + [root]:
             t[KEY_LAYOUT] = 1
@@ -1186,6 +1270,8 @@ def build_one(entry, app, objects=(), make_env=None):
                 layout.arrange(t)
             except Exception as e:     # cosmetic: never lose a build to layout
                 env.note("layout of %s: %s" % (t.name, e))
+    if recorded:
+        twins.register(tr, recorded, twins_of)
     node = _material_node(mat, root, entry["name"], values, env.node_width())
     if _texture_zones(mat, node, env):
         if LAZY_LAYOUT:
@@ -1197,8 +1283,26 @@ def build_one(entry, app, objects=(), make_env=None):
                 env.note("layout of %s: %s" % (mat.name, e))
     mat[KEY_PATH] = entry["path"]
     mat[KEY_REV] = BUILD_REVISION
+    mat[KEY_SWITCHES] = json.dumps(_switches(tr, entry))
+    if found := getattr(env, "map_textures", None):
+        from .ue_graph.maptex import finish, label
+        graphs = {g.path: g for t in [tr] + [ft.tr for ft in tr.functions.values()] for g in t.graphs.values()}
+
+        def fetch(objpath):
+            try:
+                path = env.function(objpath.rsplit("/", 1)[-1].split(".")[0], objpath)
+            except Exception:       # (not in the game's files)
+                return None
+            return tr.graph(path) if path else None
+        # map-wide textures a custom landscape can paint, their masks named (ue_graph.maptex)
+        mat[KEY_MAPS] = json.dumps(label(finish(found), graphs.values(), fetch))
+        if getattr(env, "uses_biomes", False) or entry.get("landscape_world"):
+            # scattered meshes reading them follow painted terrains (scatter_biomes)
+            from . import scatter_biomes
+            scatter_biomes.refresh()
     if entry.get("variant"):
         mat[KEY_VARIANT] = entry["variant"]
+    params.tag_build(mat, root, env, entry, settings(entry), vals, TRANSLUCENT)
     if env.reusable:
         _record_shape(mat, root, env, entry)
     notes = list(env.notes) + sorted(set(w for w in tr.warnings + [w for ft in tr.functions.values()
@@ -1241,8 +1345,10 @@ def shape_key(entry):
     """What decides a build's node trees beyond its parameter values: the master's graph, static switches and masks,
     blend/shading overrides and subsurface profile. Instances alike in all of it differ only in parameter values
     (the material's group-node inputs) and texture images."""
-    k = {g: entry.get(g) for g in ("graph", "master", "switches", "masks", "overrides", "asset", "subsurface", "sprite", "ribbon", "particle", "moves", "folds", "shell", "cosmetic", "fixed", "landscape_layers")}
+    k = {g: entry.get(g) for g in ("graph", "master", "switches", "masks", "overrides", "asset", "subsurface", "sprite", "ribbon", "particle", "moves", "folds", "shell", "cosmetic", "fixed", "landscape_layers", "landscape_channels", "landscape_world", "landscape_images", "biome_maps", "biome_rects", "biome_follow", "landscape_dropped")}
     k["head"] = _is_head(entry)
+    if entry.get("cap"):        # a texture cap (per import): a copy keeps its source's unswapped images
+        k["cap"] = entry["cap"]
     # with a time of day in the file collections stay live; without one they are folded in
     k["day"] = world.has_day()
     return hashlib.sha1(json.dumps(k, sort_keys=True, default=str).encode()).hexdigest()[:16]
@@ -1292,7 +1398,7 @@ def _root_of(mat):
 def find_shape(shape):
     """A material this file already built for that shape, current and copyable."""
     return next((m for m in bpy.data.materials if m.get(KEY_SHAPE) == shape and m.get(KEY_REV, 1) >= BUILD_REVISION
-                 and _root_of(m) is not None), None)
+                 and "mp_rvt_source" not in m and _root_of(m) is not None), None)
 
 
 def build_like(src, entry, app):
@@ -1305,7 +1411,7 @@ def build_like(src, entry, app):
     textures = match_names(entry)["textures"]
     try:
         defaults = json.loads(src.get("mp_tex_defaults", "{}"))
-        params = json.loads(root1["mp_params"])
+        declared = json.loads(root1["mp_params"])
     except (ValueError, KeyError):
         return None
     # a colour socket would clamp a negative value of this instance's, so build anew
@@ -1313,7 +1419,7 @@ def build_like(src, entry, app):
               if it.item_type == 'SOCKET' and it.in_out == 'INPUT' and it.socket_type == 'NodeSocketColor'}
     vectors = entry.get("vectors") or {}
     if any(kind == "V" and ident in colour and any(float(x) < 0.0 for x in tuple(vectors.get(name) or ())[:3])
-           for ident, kind, name, _default in params):
+           for ident, kind, name, _default in declared):
         return None
     ambiguous = object()
 
@@ -1383,9 +1489,11 @@ def build_like(src, entry, app):
     node = next(n for n in mat.node_tree.nodes if n.bl_idname == "ShaderNodeGroup" and n.node_tree == root1)
     node.node_tree = root2
     node.label = entry["name"]
+    foliage.reset(node)
+    ground.reset(node)
     scalars, vectors = entry.get("scalars") or {}, entry.get("vectors") or {}
     by_id = {s.identifier: s for s in node.inputs}
-    for ident, kind, name, default in params:
+    for ident, kind, name, default in declared:
         sock = by_id.get(ident)
         if sock is None:
             continue
@@ -1399,7 +1507,12 @@ def build_like(src, entry, app):
             sock.default_value = fit_socket(sock, rgba) if kind == "V" else float(rgba[3])
     mat[KEY_PATH] = entry["path"]
     mat[KEY_REV] = BUILD_REVISION
+    for key in (KEY_SWITCHES, KEY_MAPS):
+        if key in src:
+            mat[key] = src[key]
     mat["mp_copied_from"] = src.name
+    for key in (params.KEY_GAME, params.KEY_OVERRIDES):       # src's own: the hook takes this one's
+        mat.pop(key, None)
     if entry.get("variant"):
         mat[KEY_VARIANT] = entry["variant"]
     elif KEY_VARIANT in mat:

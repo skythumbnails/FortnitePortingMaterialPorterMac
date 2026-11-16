@@ -117,15 +117,7 @@ public partial class ExportContext
                     var masterSkeletalMesh = masterSkeletalMeshes
                         .Select(index => index.LoadOrDefault<USkeletalMesh>())
                         .FirstOrDefault(mesh => mesh is not null);
-
-                    // Fallback to the default male base skeleton so outfits whose body parts don't
-                    // resolve a MasterSkeletalMesh (creature outfits, on-demand assets that didn't
-                    // stream the part-specific reference) still carry the metadata the Blender Tasty
-                    // rig builder needs — otherwise create_tasty_rig() gets None and the rig fails
-                    // to apply ("some skins don't port with Tasty").
-                    masterSkeletalMesh ??= Meta.Provider.Provider.SafeLoadPackageObject<USkeletalMesh>(
-                        "/FortniteGame/Content/Characters/Player/Male/Medium/Base/SK_M_MALE_Base_Skeleton");
-
+                    
                     if (masterSkeletalMesh is null) break;
 
                     var meta = new ExportMasterSkeletonMeta
@@ -144,6 +136,7 @@ public partial class ExportContext
             exportPart.Meta.Cloth = Cloth(skeletalMesh);     // MP
             exportPart.Meta.AnimScript = AnimScript(additionalData, exportPart.Meta.Cloth is not null);     // MP
         }        
+        exportPart.Meta.Overlay = Overlay(part, skeletalMesh);     // MP
         if (EffectsPick) PartEffects(part, exportPart);     // MP
         return ShellFur(part, exportPart);     // MP
     }

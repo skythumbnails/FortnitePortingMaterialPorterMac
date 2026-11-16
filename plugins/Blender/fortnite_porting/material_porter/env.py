@@ -15,7 +15,8 @@ import re
 
 import bpy
 
-from . import world
+from . import landscape_layers, world
+from .ue_graph.core import section_name
 from .ue_graph import BOUNDS_MAX, BOUNDS_MIN, PART_BOUNDS_MAX, PART_BOUNDS_MIN, PIXEL_NORMAL, WATER_DEPTH_DEFAULT, Val
 
 # A vector parameter that names a colour gets a colour socket (a picker); any other (offset, direction, channel, size)
@@ -123,6 +124,8 @@ class MaterialEnv:
         self._images = {}
         self._defaults = {}
         self.notes = []
+        # probing a projection (ue_graph map textures): the world at a fixed point, parameters as plain values
+        self.probe = None
         self.root = None        # the material's node group: parameters become its inputs
         self.caller = None      # the function a parameter is reached through (its panel)
         self._params = {}       # key -> (interface item, Val, value, panel name)
@@ -178,7 +181,7 @@ class MaterialEnv:
         def make():
             cam = self.tr.node("ShaderNodeCameraData", "camera data")
             to_world = self.tr.node("ShaderNodeVectorTransform", "view to world", vector_type='VECTOR', convert_from='CAMERA', convert_to='WORLD')
-            self.tr.L.new(cam.outputs["View Vector"], to_world.inputs[0])
+            self.tr.L.new(cam.outputs["View Vector"], to_world.inputs["Vector"])
             away = self.tr.vmath('NORMALIZE', Val(to_world.outputs[0], 3), out_w=3)
             seen = self.tr.vmath('SCALE', away, self.tr.const(-1.0), out_w=3)
             # Cycles evaluates displacement once per mesh without a camera: use the camera direction
@@ -207,6 +210,8 @@ class MaterialEnv:
         return self.once("camvec", lambda: self._ue(self._incoming()))
 
     def world_position(self, camera_relative=False):
+        if self.probe is not None:
+            return self.tr.const(self.probe, 3)
         p = self.once("wpos", lambda: self._ue(Val(self._geo().outputs["Position"], 3), 100.0))
         return self.tr.vmath('SUBTRACT', p, self.camera_position(), out_w=3) if camera_relative else p
 
@@ -229,6 +234,38 @@ class MaterialEnv:
             return self._ue(Val(n.outputs["Location"], 3), 100.0)
         p = self.once("actor", make)
         return self.tr.vmath('SUBTRACT', p, self.camera_position(), out_w=3) if camera_relative else p
+
+    # a material that writes the RVT reads its own output instead (ue_graph.translator.material_attributes)
+    writes_rvt = False
+    foliage = False     # build.settings' "foliage": only foliage reads the bake (statics.virtual_texture_blends)
+
+    def _rvt(self, position):
+        from .rvt import lookup_group
+        n = self.tr.node("ShaderNodeGroup", "Runtime Virtual Texture")
+        n.node_tree = lookup_group()
+        self.tr.link(self.tr.as3(position), n.inputs["Position"])
+        return n
+
+    def runtime_virtual_texture(self, out, position):
+        """A RuntimeVirtualTextureSample's output out at position (UE cm; None: the pixel's): Base Color from the
+        file's baked RVT (rvt.py); None for the outputs it doesn't bake (the translator's stand-ins)."""
+        if out != 0 or self.writes_rvt or self.probe is not None:
+            return None
+        return Val(self._rvt(position or self.world_position()).outputs["Base Color"], 3)
+
+    def virtual_texture_available(self):
+        return not self.writes_rvt and self.probe is None
+
+    def virtual_texture_valid(self):
+        """1 where the file's RVT is baked under the pixel: a VirtualTextureFeatureSwitch takes its PC branch there."""
+        if not self.virtual_texture_available():
+            return None
+        def make():
+            from .ground import ATTR_OFF, attribute
+            # Ground Blend Off (per instance) keeps the no-RVT side
+            on = self.tr.math('SUBTRACT', self.tr.const(1.0), attribute(self.tr, ATTR_OFF))
+            return self.tr.math('MULTIPLY', Val(self._rvt(self.world_position()).outputs["Valid"], 1), on)
+        return self.once("rvt valid", make)
 
     def light_direction(self):
         """Towards the sun: the file's sun group (driven by the scene's sun lamp or a time of day)."""
@@ -287,6 +324,16 @@ class MaterialEnv:
 
     # ------------------------------------------------------------ mesh
     def uv(self, index):
+        if self.entry.get("landscape_world") and index <= 2:
+            # a landscape's UVs are its own coordinates (UV0 XY, UV1 XZ, UV2 YZ, in quads): on a mesh a landscape
+            # material was put on, the world in 1 m quads, as its LandscapeLayerCoords (Hera V2's colour map reads UV0)
+            def quads():
+                wp = self.tr.comps(self.world_position(False))
+                a, b = ((0, 1), (0, 2), (1, 2))[index]
+                return self.tr.combine([self.tr.binop('DIVIDE', wp[a], self.tr.const(100.0)),
+                                        self.tr.binop('DIVIDE', wp[b], self.tr.const(100.0))])
+            return quads() if self.probe is not None else self.once("landscape uv%d" % index, quads)
+
         def make():
             n = self.tr.node("ShaderNodeUVMap", "UV%d" % index)
             n.uv_map = "UV%d" % index
@@ -312,7 +359,9 @@ class MaterialEnv:
     def landscape_layer(self, name):
         """Whether a layer is painted on the landscape component this material is built for
         (entry["landscape_layers"]; otherwise a LandscapeLayerSwitch compiles its LayerNotUsed side, as UE does per
-        component). Unknown counts as painted."""
+        component). Unknown counts as painted; on a mesh a material was put on, every layer but those left out."""
+        if self.entry.get("landscape_world"):
+            return name not in (self.entry.get("landscape_dropped") or ())
         layers = self.entry.get("landscape_layers")
         return True if layers is None else name in layers
 
@@ -320,20 +369,50 @@ class MaterialEnv:
         """A landscape layer's weight: the exported landscape's colour layer of that name (a grey weight: its red
         channel); 0 on another mesh or where a component doesn't paint the layer.
         None for a layer the component is known not to paint: it is left out of the blend with its textures,
-        as UE compiles each component (the Ch4 jungle landscape's 43 samplers are past Eevee's 32)."""
+        as UE compiles each component (the Ch4 jungle landscape's 43 samplers are past Eevee's 32). On a mesh a
+        material was put on every layer is read, but those left out (Eevee's limits): one it has no weightmap
+        channel for yet still gets a node, so the panel adds it (a feature bringing in a layer)."""
         layers = self.entry.get("landscape_layers")
-        if layers is not None and name not in layers:
+        if self.entry.get("landscape_world"):
+            if name in (self.entry.get("landscape_dropped") or ()):
+                return None
+        elif layers is not None and name not in layers:
             return None
+
+        return self.once("shown layer " + name, lambda: self.tr.binop(
+            'MULTIPLY', self._layer_weight(name), self.shown(landscape_layers.hide_key(name))))
+
+    def shown(self, key):
+        """1 - the mesh's custom property `key` (0 without it), as an object attribute: hiding a layer or a biome mask
+        (the Landscape tab's eye) zeroes it in the material, the paint left as it is."""
+        def make():
+            n = self.tr.node("ShaderNodeAttribute", "hidden " + key, attribute_type='OBJECT', attribute_name=key)
+            return self.tr.binop('SUBTRACT', self.tr.const(1.0), Val(n.outputs["Fac"], 1))
+        return self.once("hidden " + key, make)
+
+    def _layer_weight(self, name):
+        # its weightmap's channel (weightmaps), its channel of a packed attribute (landscape_layers: Attribute1's
+        # red...), else its own attribute's red
+        attribute, channel = (self.entry.get("landscape_channels") or {}).get(name, (name, 0))
+        if (image := (self.entry.get("landscape_images") or {}).get(name)) is not None:
+            def from_image():
+                uv = self.once("weights uv", lambda: self.tr.node("ShaderNodeUVMap", "weightmap UVs", uv_map="mp_weights"))
+                n = self.tr.node("ShaderNodeTexImage", "layer " + name, interpolation='Linear', extension='EXTEND')
+                n.image = bpy.data.images.get(image[0])
+                self.tr.link(Val(uv.outputs["UV"], 3), n.inputs["Vector"])
+                return self.tr.comps(Val(n.outputs["Color"], 3))[image[1]]
+            return self.once("layer " + name, from_image)
 
         def make():
             n = self.tr.node("ShaderNodeVertexColor", "layer " + name)
-            n.layer_name = name
-            return self.tr.comps(Val(n.outputs["Color"], 3))[0]
+            n.layer_name = attribute
+            return self.tr.comps(Val(n.outputs["Color"], 3))[channel]
         return self.once("layer " + name, make)
 
     def landscape_uv(self, index):
-        """A landscape's texture coordinates (UV0: landscape-wide quads, as exported)."""
-        return self.uv(index)
+        """A landscape's texture coordinates (UV0: landscape-wide quads, as exported); None on a mesh a landscape
+        material was put on, whose own UVs aren't quads (the world in 1 m quads then)."""
+        return None if self.entry.get("landscape_world") else self.uv(index)
 
     def vertex_color(self):
         def make():
@@ -502,6 +581,8 @@ class MaterialEnv:
             # one the import settles (Rim Light off: baseBrightness 0): a value, not a control
             return self.tr.const(float(fixed[name]))
         v = float(self.entry.get("scalars", {}).get(name, default))
+        if self.probe is not None:
+            return self.tr.const(v)
         self.graph_defaults.setdefault("P: " + name, float(default or 0.0))
         self._defaults["P: " + name] = v
         fn = self.tr.function
@@ -532,6 +613,9 @@ class MaterialEnv:
         if not name or name in self.GAME_DRIVEN:
             rgba = tuple(rgba) + (1.0,) * (4 - len(rgba))
             return self.tr.const(tuple(float(x) for x in rgba[:3]), 3), self.tr.const(float(rgba[3]))
+        if self.probe is not None:
+            rgba = tuple(self.entry.get("vectors", {}).get(name, rgba)) + (1.0,) * (4 - len(rgba))
+            return self.tr.const(tuple(float(x) for x in rgba[:3]), 3), self.tr.const(float(rgba[3]))
         self.graph_defaults.setdefault("V: " + name, tuple(float(x) for x in rgba) + (1.0,) * (4 - len(rgba)))
         graph_default = rgba
         rgba = tuple(self.entry.get("vectors", {}).get(name, rgba)) + (1.0,) * (4 - len(rgba))
@@ -557,7 +641,8 @@ class MaterialEnv:
 
     def primitive_data(self, v, index, w):
         """UE's Custom Primitive Data: floats a placed component carries (e.g. a tree's season tint), read from the
-        object's mp_cpd<index> properties (a map import sets them, with mp_cpd = 1).
+        object's mp_cpd<index> properties (a map import sets them, with mp_cpd = 1), or the instance's attributes of
+        the same names where geometry nodes instance it (a building ISM's instances, see instances.py).
 
         An object without them keeps the material's own value `v`, and so does an index past the array the component
         carries (mp_cpd_n floats; UE starts a primitive's data from the parameters' defaults). An object imported
@@ -568,7 +653,7 @@ class MaterialEnv:
             def make():
                 with tr.at("Parameters"):
                     n = tr.node("ShaderNodeAttribute", name)
-                n.attribute_type = 'OBJECT'
+                n.attribute_type = 'INSTANCER'     # the instance's attribute, else the object's own property
                 n.attribute_name = name
                 return Val(n.outputs["Fac"], 1)
             return self.once("attr " + name, make)
@@ -711,7 +796,8 @@ class MaterialEnv:
         return Val(out.s, 4, tr.math('ADD', da, tr.math('MULTIPLY', tr.math('SUBTRACT', alpha, da), flag)))
 
     def instance_data(self, v, index, w):
-        """UE's PerInstanceCustomData: an instanced mesh's own floats, from the object's mp_pic<index> properties.
+        """UE's PerInstanceCustomData: an instanced mesh's own floats, from the instance's mp_pic<index> attributes
+        (a map's instanced mesh as points, see instances.py), else the object's properties of the same names.
         The material's default `v` is used where the instance has fewer than index + w of them
         (mp_pic holds the count, 0 on other objects), as UE reads past NumCustomDataFloats."""
         tr = self.tr
@@ -720,7 +806,7 @@ class MaterialEnv:
             def make():
                 with tr.at("Parameters"):
                     n = tr.node("ShaderNodeAttribute", name)
-                n.attribute_type = 'OBJECT'
+                n.attribute_type = 'INSTANCER'     # the instance's attribute, else the object's own property
                 n.attribute_name = name
                 return Val(n.outputs["Fac"], 1)
             return self.once("attr " + name, make)
@@ -849,6 +935,10 @@ class MaterialEnv:
         self.tex_default.setdefault(name, default)
         return key
 
+    def _in_night_tint(self):
+        """Whether what's being built is inside the anime shader's MF_TODColorAdjustment (group or inlined)."""
+        return section_name("MF_TODColorAdjustment") in (self.tr.section or ())
+
     def collection(self, name, path=None):
         """A material parameter collection's value for `name`, through the file's group for that collection
         (a time of day makes it follow its hour where its day sequence keys the value)."""
@@ -863,6 +953,9 @@ class MaterialEnv:
                 # aside: it follows the scene's lamp). They are folded in as values so what reads them folds
                 # away too (a character's TODColor Adjustment, Scalar Time of Day).
                 if name not in world.LIVE and not world.has_day():
+                    # the anime skins' night tint stays live: the sky add-on's hour and lamp drive it
+                    if name in world.NIGHT_READS and self._in_night_tint():
+                        return world.night(self.tr, name)
                     return self.tr.const(default)
                 return world.collection(self.tr, path, name, default)
         self.note("collection %s has no %s: 0" % (path.split("/")[-1], name))
@@ -876,6 +969,8 @@ class MaterialEnv:
         return None
 
     def _record(self, key):
+        if not key:     # a texture parameter left unset: nothing to ask the app for
+            return None
         try:
             return self.app.texture(key)
         except Exception as e:
@@ -915,6 +1010,9 @@ class MaterialEnv:
         normal = "Normal" in str(sampler)
         if normal:
             self.tex_normal.add(key)
+        slices = self._slices(key)
+        if slices:
+            return slices[0]
         return self._image(key, self._record(key), "normal" if normal else None)
 
     # a skinned mesh's importer turns on Object.add_rest_position_attribute: the "rest_position" attribute holds
@@ -968,25 +1066,39 @@ class MaterialEnv:
         return img, int(rec.get("Width", 1)), int(rec.get("Depth", 1))
 
     def texture_slices(self, key, sampler):
-        """A texture array: the app exports a stack of slices (slice 0 on top); each becomes its own image."""
-        self.reusable = False
+        slices = self._slices(key)
+        if slices:
+            self.reusable = False       # every slice is baked in; build_like swaps one image per node
+        return slices
+
+    def _slices(self, key):
+        """A texture array: the app exports a stack of slices (slice 0 on top); each becomes its own image. Slice 0
+        takes the texture's name: sampled as a plain texture (and found by name, as biome maps do) an array is it."""
         rec = self._record(key)
         if rec is None or rec.get("Kind") != "array" or int(rec.get("Depth", 1)) < 2:
             return None
+        if ("slices", key) in self._images:
+            return self._images[("slices", key)]
+        short = key.split("/")[-1].split(".")[0]
         stack = self._image(key, rec)
+        stack.name = short + " (stack)"
         w, h = stack.size
         depth = int(rec["Depth"])
         sh = h // depth
         px = list(stack.pixels[:])
         out = []
         for i in range(depth):
-            name = "%s [%d]" % (key.split("/")[-1].split(".")[0], i)
-            img = bpy.data.images.get(name) or bpy.data.images.new(name, w, sh, alpha=True, float_buffer=stack.is_float)
+            name = short if i == 0 else "%s [%d]" % (short, i)
+            img = bpy.data.images.get(name)
+            if img is None or tuple(img.size) != (w, sh):
+                img = bpy.data.images.new(name, w, sh, alpha=True, float_buffer=stack.is_float)
             img.alpha_mode = 'CHANNEL_PACKED'     # alpha is data, as in UE (see _image)
+            # before the pixels: a colour space change regenerates a generated image's buffer (blank)
+            img.colorspace_settings.name = stack.colorspace_settings.name
             # Blender's pixel rows run bottom up, so slice 0 (the top) is the last rows
             top = h - (i + 1) * sh
             img.pixels[:] = px[top * w * 4:(top + sh) * w * 4]
-            img.colorspace_settings.name = stack.colorspace_settings.name
             img.pack()
             out.append(img)
+        self._images[("slices", key)] = out
         return out

@@ -406,6 +406,4 @@ plugins/Blender/fortnite_porting/ueformat/
 plugins/Unreal/UEFormat/
 # Material Porter fork: the owner's build switches (UEFN island export)
 src/FortnitePorting/Fork.local.props
-
-# macOS build output (macos/build-dmg.sh)
 macos/out/

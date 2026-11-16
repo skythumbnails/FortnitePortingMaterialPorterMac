@@ -1,4 +1,5 @@
 import os.path
+import bmesh
 import bpy
 import numpy as np
 from math import radians
@@ -46,7 +47,7 @@ class MeshImportContext(LightImportMixin):     # MP: spot and rect lights
             target_meshes = data.get("Meshes")
 
         self.meshes = target_meshes
-        self.mesh_index = {id(m): i for i, m in enumerate(target_meshes)}     # MP: progress without a scan per object
+        self.mesh_indices = {id(mesh): index for index, mesh in enumerate(target_meshes)}
         for mesh in target_meshes:
             self.import_model(mesh, can_spawn_at_3d_cursor=True)
 
@@ -57,14 +58,14 @@ class MeshImportContext(LightImportMixin):     # MP: spot and rect lights
                 
         if self.type in [EExportType.OUTFIT]:
             for imported_mesh in self.imported_meshes:
-                self.parent_deform_bones(imported_mesh["Skeleton"], ["dfrm_", "deform_"])
+                self.parent_deform_bones(imported_mesh["Skeleton"], ["dfrm_", "deform_", "rt_"])
                 self.parent_bones(imported_mesh["Skeleton"], extra_deform_mappings)
             
         mp.before_merge(self)     # MP
         if self.type in [EExportType.OUTFIT, EExportType.FALL_GUYS_OUTFIT, EExportType.LEGO_OUTFIT, EExportType.LEGO_WILDLIFE] and self.options.get("MergeArmatures"):     # MP: LEGO too
             master_skeleton = merge_parts(self.imported_meshes)
             master_mesh = get_armature_mesh(master_skeleton)
-            mp.after_merge(master_mesh)     # MP
+            mp.after_merge(self, master_mesh)     # MP
             # Update attribute to account for joined mesh
             self.update_preskinned_bounds(master_mesh)
             
@@ -161,7 +162,8 @@ class MeshImportContext(LightImportMixin):     # MP: spot and rect lights
         path = mesh.get("Path")
         name = mesh.get("Name")
         part_type = EFortCustomPartType(mesh.get("Type"))
-        
+
+        if mp.tile_placed(self, mesh): return None     # MP
         if mesh.get("IsEmpty"):
             empty_object = mp.make_empty(self, mesh, name)     # MP: an effect's sprite or ribbon
 
@@ -177,8 +179,8 @@ class MeshImportContext(LightImportMixin):     # MP: spot and rect lights
             mp.finish_empty(self, mesh, empty_object, imported_children)     # MP
             return empty_object
         
-        if self.type in [EExportType.PREFAB, EExportType.WORLD] and (index := self.mesh_index.get(id(mesh))) is not None:
-            Log.info(f"Importing Actor: {name} {index} / {len(self.meshes)}")
+        if self.type in [EExportType.PREFAB, EExportType.WORLD] and (index := self.mesh_indices.get(id(mesh))) is not None:
+            mp.actor(self, index)     # MP: a count every so often, not a line per actor
 
         mesh_name = path.split(".")[1]
         if self.type in [EExportType.PREFAB, EExportType.WORLD] and (existing_mesh_data := bpy.data.meshes.get(mesh_name + "_LOD0")):
@@ -196,7 +198,13 @@ class MeshImportContext(LightImportMixin):     # MP: spot and rect lights
             imported_mesh = get_armature_mesh(imported_object)
 
             if EPolygonType(self.options.get("PolygonType")) == EPolygonType.QUADS and imported_mesh is not None:
-                mp.tris_to_quads(imported_mesh)     # MP
+                bm = bmesh.new()
+                bm.from_mesh(imported_mesh.data)
+                bmesh.ops.join_triangles(bm, faces=bm.faces[:], cmp_uvs=True,
+                                         angle_face_threshold=radians(40), angle_shape_threshold=radians(40))
+                bm.to_mesh(imported_mesh.data)
+                bm.free()
+                imported_mesh.data.update()
 
         if (override_vertex_colors := mesh.get("OverrideVertexColors")) and len(override_vertex_colors) > 0:
             imported_mesh.data = imported_mesh.data.copy()
@@ -279,7 +287,6 @@ class MeshImportContext(LightImportMixin):     # MP: spot and rect lights
         meta["TextureData"] = mesh.get("TextureData")
 
         final = mp.final_materials(mesh, self.override_materials)     # MP: only each slot's final material is built
-
         # Lowercase part hint for the optional Forge V4 material setup
         # (processing/forge.py) - the material name still wins over this hint.
         meta["ForgePart"] = {
@@ -353,7 +360,7 @@ class MeshImportContext(LightImportMixin):     # MP: spot and rect lights
             for instance_index, instance_transform in enumerate(instances):
                 instance_name = f"Instance_{instance_index}_" + name
                 
-                Log.info(f"Importing Instance: {instance_name} {instance_index} / {len(instances)}")
+                mp.instances(name, instance_index, len(instances))     # MP: one line per instanced mesh
                 
                 instance_object = bpy.data.objects.new(f"Instance_{instance_index}_" + name, mesh_data)
                 self.collection.objects.link(instance_object)
@@ -366,6 +373,7 @@ class MeshImportContext(LightImportMixin):     # MP: spot and rect lights
                 for i, slot_mat in enumerate(instance_materials):
                     instance_object.material_slots[i].material = slot_mat
 
+        imported_object = mp.instance_points(self, mesh, imported_object, parent, can_spawn_at_3d_cursor)     # MP: a map's instanced mesh as points
 
         return imported_object
     
